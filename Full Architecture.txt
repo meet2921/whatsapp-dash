@@ -1,0 +1,1151 @@
+# WhatsApp Business SaaS Platform — Full Architecture Design
+
+**Developer:** Meet Bhayani @ Tierce India Pvt Ltd
+**Platform:** TierceMsg (codename: `wmsg`)
+**Working directory:** `d:\WORK\whatsapp-dash\`
+**Purpose:** Multi-tenant WhatsApp engagement SaaS (internal + reseller)
+
+---
+
+## 1. System Overview
+
+A **modular monolith** — single deployable FastAPI process with strictly bounded modules. Extracted to microservices later if needed, without restructuring.
+  
+**Core principles:**
+- Every table has `org_id` (multi-tenant isolation, not optional)
+- All operations idempotent (safe to retry anywhere in the stack)
+- Money operations are two-phase (reserve → confirm/rollback), never fire-and-forget
+- Webhooks: receive fast (< 200ms), process slow (async workers)
+- Every log line carries `request_id` + `org_id` from day one
+
+---
+
+## 2. High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            EXTERNAL SERVICES                                │
+│          Meta Cloud API    │    Razorpay    │    AWS S3/R2    │   OpenAI    │
+└──────────┬─────────────────┴───────┬────────┴────────┬────────┴─────┬───────┘
+           │                         │                 │              │
+┌──────────▼─────────────────────────▼─────────────────▼──────────────▼───────┐
+│                     NGINX  (TLS · Rate-limit · Routing)                     │
+└───────┬─────────────────────────────────────────────────────────┬───────────┘
+        │                                                         │
+        ▼                                                         ▼
+┌───────────────┐                                      ┌──────────────────────┐
+│  Next.js 15   │◄──── REST / WebSocket ───────────────│  FastAPI  :8000      │
+│  (Frontend)   │                                      │  (API Gateway)       │
+└───────────────┘                                      └──────────┬───────────┘
+                                                                  │
+                    ┌─────────────────────────────────────────────┤
+                    │                 MODULES                      │
+                    ├──────────────────────────────────────────────┤
+                    │  Auth   │ Messaging │ Campaigns │ Contacts   │
+                    │  Billing│ Automation│ Analytics │ Admin      │
+                    │  Media  │ Webhooks  │ Templates │ Inbox (WS) │
+                    └──────────────────────────────────────────────┘
+                                          │
+              ┌───────────────────────────┼───────────────────────────┐
+              │                           │                           │
+              ▼                           ▼                           ▼
+   ┌──────────────────┐       ┌───────────────────┐       ┌──────────────────┐
+   │  PostgreSQL 16   │       │   Redis 7.2        │       │  S3 / R2         │
+   │  Primary DB      │       │  Cache │ Queue     │       │  Media Storage   │
+   │  (Multi-AZ prod) │       │  Pub/Sub │ Locks   │       │                  │
+   └──────────────────┘       └───────────────────┘       └──────────────────┘
+              │                           │
+   ┌──────────▼───────────────────────────▼──────────────────────────────────┐
+   │                         CELERY WORKERS                                  │
+   │                                                                         │
+   │   campaign_queue  │  message_queue  │  webhook_queue  │  billing_queue  │
+   │   media_queue     │  analytics_queue                                    │
+   │                                                                         │
+   │   celery_beat  (scheduler: webhook retry, stats aggregation, balance)   │
+   └─────────────────────────────────────────────────────────────────────────┘
+              │
+   ┌──────────▼───────────────────────────────────────────────────────────────┐
+   │                        OBSERVABILITY STACK                               │
+   │   Prometheus + Grafana │ OpenTelemetry → Jaeger/Tempo │ Loguru JSON logs │
+   └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Multi-Tenant Isolation Design
+
+```
+Every DB table:
+  org_id  UUID  NOT NULL  INDEX
+
+Every API request:
+  JWT → decoded → org_id injected into request context
+  SQLAlchemy event listener: auto-appends WHERE org_id = :current_org on all queries
+  Middleware: sets org_id in ContextVar for logging
+
+Tenant boundaries:
+  Organizations → Users → WABAAccounts → PhoneNumbers
+  Contacts, Conversations, Messages, Campaigns, Flows
+  Wallets, Transactions, Invoices — all scoped to org_id
+```
+
+**Row-Level Security (optional, Phase 2):** Enable PostgreSQL RLS policies per table as second layer of defense.
+
+---
+
+## 4. Complete Database Schema
+
+### 4.1 Tenant & Users
+```
+organizations
+  id UUID PK
+  name VARCHAR(255)
+  slug VARCHAR(100) UNIQUE
+  plan_id UUID → plans.id
+  timezone VARCHAR(50) DEFAULT 'Asia/Kolkata'
+  is_active BOOL
+  is_suspended BOOL
+  suspension_reason TEXT
+  created_at, updated_at TIMESTAMPTZ
+
+plans
+  id UUID PK
+  name VARCHAR(100)           -- Starter, Growth, Enterprise
+  monthly_fee NUMERIC(10,2)
+  msg_limit INT               -- NULL = unlimited
+  contact_limit INT
+  features JSONB              -- {"automation": true, "ai_bot": true}
+  is_active BOOL
+
+users
+  id UUID PK
+  org_id UUID → organizations.id  CASCADE DELETE
+  email VARCHAR(255) UNIQUE
+  hashed_password VARCHAR(255)
+  full_name VARCHAR(255)
+  role ENUM(super_admin, org_admin, agent, viewer)
+  is_active BOOL
+  last_login TIMESTAMPTZ
+  preferences JSONB
+  created_at, updated_at TIMESTAMPTZ
+  INDEX(org_id), INDEX(email)
+```
+
+### 4.2 WhatsApp Accounts
+```
+waba_accounts
+  id UUID PK
+  org_id UUID → organizations.id
+  waba_id VARCHAR(100) UNIQUE       -- Meta WABA ID
+  access_token TEXT (encrypted)     -- System User Token
+  webhook_secret VARCHAR(255)
+  business_name VARCHAR(255)
+  status VARCHAR(50)                -- active, suspended, banned
+  created_at, updated_at TIMESTAMPTZ
+  INDEX(org_id)
+
+phone_numbers
+  id UUID PK
+  org_id UUID
+  waba_id UUID → waba_accounts.id
+  phone_number_id VARCHAR(100) UNIQUE  -- Meta Phone Number ID
+  display_number VARCHAR(20)
+  display_name VARCHAR(255)
+  quality_rating VARCHAR(20)           -- GREEN, YELLOW, RED
+  messaging_limit VARCHAR(50)          -- 1K, 10K, 100K, unlimited
+  is_active BOOL
+  created_at TIMESTAMPTZ
+  INDEX(org_id)
+
+message_templates
+  id UUID PK
+  org_id UUID
+  waba_id UUID → waba_accounts.id
+  meta_template_id VARCHAR(100)
+  name VARCHAR(512)
+  category ENUM(MARKETING, UTILITY, AUTHENTICATION)
+  language VARCHAR(10)
+  status ENUM(PENDING, APPROVED, REJECTED, PAUSED)
+  components JSONB                   -- full Meta template structure
+  rejection_reason TEXT
+  created_at, updated_at TIMESTAMPTZ
+  UNIQUE(org_id, name, language)
+  INDEX(org_id, status)
+```
+
+### 4.3 Contacts & CRM
+```
+contacts
+  id UUID PK
+  org_id UUID
+  phone VARCHAR(20)                   -- E.164 format
+  name VARCHAR(255)
+  email VARCHAR(255)
+  language VARCHAR(10) DEFAULT 'en'
+  is_opted_in BOOL DEFAULT TRUE
+  opted_in_at TIMESTAMPTZ
+  opted_out_at TIMESTAMPTZ
+  lead_status VARCHAR(50)             -- new, contacted, qualified, converted
+  attributes JSONB                    -- custom CRM fields per tenant
+  created_at, updated_at TIMESTAMPTZ
+  UNIQUE(org_id, phone)
+  INDEX(org_id, is_opted_in)
+  GIN INDEX on attributes            -- for JSONB field queries
+
+tags
+  id UUID PK
+  org_id UUID
+  name VARCHAR(100)
+  color VARCHAR(7)
+  UNIQUE(org_id, name)
+
+contact_tags
+  contact_id UUID → contacts.id
+  tag_id UUID → tags.id
+  PRIMARY KEY(contact_id, tag_id)
+
+segments
+  id UUID PK
+  org_id UUID
+  name VARCHAR(255)
+  filter_config JSONB                -- {"tags": ["vip"], "lead_status": "qualified"}
+  contact_count INT
+  last_computed_at TIMESTAMPTZ
+```
+
+### 4.4 Conversations & Messages
+```
+conversations
+  id UUID PK
+  org_id UUID
+  contact_id UUID → contacts.id
+  phone_number_id UUID → phone_numbers.id
+  status VARCHAR(20)                  -- open, resolved, pending
+  assigned_to UUID → users.id
+  last_message_at TIMESTAMPTZ
+  session_expires_at TIMESTAMPTZ      -- 24-hour window expiry
+
+  -- UPGRADE 6: Conversation locking
+  locked_by UUID → users.id
+  locked_at TIMESTAMPTZ
+  lock_expires_at TIMESTAMPTZ
+
+  created_at, updated_at TIMESTAMPTZ
+  INDEX(org_id, status)
+  INDEX(org_id, contact_id)
+
+messages
+  id UUID PK
+  org_id UUID
+  conversation_id UUID → conversations.id
+  wa_message_id VARCHAR(100) UNIQUE   -- Meta's message ID
+  direction ENUM(inbound, outbound)
+  status ENUM(queued, sent, delivered, read, failed)
+  message_type VARCHAR(30)            -- text, image, document, template, audio, video
+  content JSONB                       -- flexible payload per message_type
+  template_id UUID → message_templates.id
+  campaign_id UUID → campaigns.id
+  cost_credits NUMERIC(10,6)          -- INR credits deducted
+
+  -- UPGRADE 1: Idempotency
+  idempotency_key VARCHAR(255) NOT NULL
+
+  sent_at TIMESTAMPTZ
+  delivered_at TIMESTAMPTZ
+  read_at TIMESTAMPTZ
+  failed_reason TEXT
+  created_at TIMESTAMPTZ
+
+  UNIQUE INDEX(idempotency_key)       -- UPGRADE 1
+  INDEX(conversation_id, created_at DESC)
+  INDEX(wa_message_id)
+  INDEX(org_id, campaign_id)
+```
+
+### 4.5 Campaigns
+```
+campaigns
+  id UUID PK
+  org_id UUID
+  name VARCHAR(255)
+  template_id UUID → message_templates.id
+  phone_number_id UUID → phone_numbers.id
+  status ENUM(draft, scheduled, running, paused, completed, failed)
+  scheduled_at TIMESTAMPTZ
+  started_at TIMESTAMPTZ
+  completed_at TIMESTAMPTZ
+  total_recipients INT DEFAULT 0
+  sent_count INT DEFAULT 0
+  delivered_count INT DEFAULT 0
+  read_count INT DEFAULT 0
+  failed_count INT DEFAULT 0
+  estimated_cost NUMERIC(10,4)
+  actual_cost NUMERIC(10,4)
+  created_by UUID → users.id
+  created_at, updated_at TIMESTAMPTZ
+  INDEX(org_id, status)
+
+campaign_recipients
+  id UUID PK
+  campaign_id UUID → campaigns.id  CASCADE DELETE
+  contact_id UUID → contacts.id
+  phone VARCHAR(20)
+  template_variables JSONB
+  status ENUM(queued, sent, delivered, read, failed)
+  message_id UUID → messages.id
+  error_message TEXT
+  INDEX(campaign_id, status)
+```
+
+### 4.6 Billing & Wallet
+
+```
+credit_rates
+  id UUID PK
+  conversation_type VARCHAR(50)       -- marketing, utility, authentication, service
+  country_code VARCHAR(2)
+  meta_cost_usd NUMERIC(10,6)         -- what Meet pays Meta
+  selling_price_inr NUMERIC(10,4)     -- what clients are charged
+  usd_to_inr_rate NUMERIC(8,4)
+  org_id UUID NULLABLE               -- NULL = global default; set for per-tenant pricing
+  is_active BOOL
+  effective_from TIMESTAMPTZ
+  INDEX(conversation_type, country_code, is_active)
+
+wallets
+  id UUID PK
+  org_id UUID UNIQUE
+  balance NUMERIC(12,4) NOT NULL DEFAULT 0
+  low_balance_threshold NUMERIC(10,4) DEFAULT 500
+  auto_recharge_enabled BOOL DEFAULT FALSE
+  auto_recharge_amount NUMERIC(10,4)
+  auto_recharge_trigger NUMERIC(10,4)
+  updated_at TIMESTAMPTZ
+
+wallet_transactions
+  id UUID PK
+  org_id UUID
+  wallet_id UUID → wallets.id
+  type ENUM(credit, debit, refund, adjustment)
+
+  -- UPGRADE 2: Two-phase billing
+  status ENUM(pending, confirmed, rolled_back)
+
+  amount NUMERIC(12,4)
+  balance_before NUMERIC(12,4)
+  balance_after NUMERIC(12,4)
+  description TEXT
+  reference_id VARCHAR(255)           -- Razorpay order/payment ID
+  message_id UUID → messages.id
+  campaign_id UUID → campaigns.id
+
+  -- UPGRADE 1: Idempotency
+  idempotency_key VARCHAR(255) NOT NULL
+
+  created_at TIMESTAMPTZ
+  UNIQUE INDEX(org_id, idempotency_key)   -- UPGRADE 1
+  INDEX(org_id, created_at DESC)
+
+invoices
+  id UUID PK
+  org_id UUID
+  invoice_number VARCHAR(50) UNIQUE
+  period_start DATE
+  period_end DATE
+  amount_inr NUMERIC(12,4)
+  gst_amount NUMERIC(12,4)
+  total_amount NUMERIC(12,4)
+  status VARCHAR(20)                  -- paid, pending, failed
+  razorpay_payment_id VARCHAR(100)
+  pdf_url TEXT
+  created_at TIMESTAMPTZ
+```
+
+### 4.7 Automation & Bots
+```
+flows
+  id UUID PK
+  org_id UUID
+  name VARCHAR(255)
+  trigger_type VARCHAR(50)            -- keyword, inbound_message, opt_in, campaign_reply
+  trigger_config JSONB                -- {"keywords": ["hi", "hello"]}
+  is_active BOOL
+  use_ai BOOL DEFAULT FALSE
+  ai_system_prompt TEXT
+  created_at, updated_at TIMESTAMPTZ
+  INDEX(org_id, is_active)
+
+flow_steps
+  id UUID PK
+  flow_id UUID → flows.id  CASCADE DELETE
+  step_order INT
+  step_type VARCHAR(50)               -- send_message, wait, condition, ai_reply, webhook_call
+  config JSONB
+  next_step_id UUID → flow_steps.id
+  UNIQUE(flow_id, step_order)
+
+flow_executions
+  id UUID PK
+  org_id UUID
+  flow_id UUID → flows.id
+  contact_id UUID → contacts.id
+  conversation_id UUID → conversations.id
+  current_step_id UUID → flow_steps.id
+  status VARCHAR(20)                  -- running, completed, failed, paused
+  context JSONB                       -- runtime variables
+  started_at TIMESTAMPTZ
+  completed_at TIMESTAMPTZ
+```
+
+### 4.8 Webhook Events — UPGRADE 4
+```
+webhook_events
+  id UUID PK
+  source VARCHAR(50)                  -- meta, razorpay
+  event_type VARCHAR(100)
+  payload JSONB
+  processed BOOL DEFAULT FALSE
+  retry_count INT DEFAULT 0
+  last_error TEXT
+
+  -- UPGRADE 1: Idempotency
+  idempotency_key VARCHAR(255) NOT NULL
+
+  created_at TIMESTAMPTZ
+  UNIQUE INDEX(source, idempotency_key)   -- UPGRADE 1
+  INDEX(processed, retry_count)           -- for retry scanner beat task
+```
+
+### 4.9 Media Assets — UPGRADE 7
+```
+media_assets
+  id UUID PK
+  org_id UUID
+  uploaded_by UUID → users.id
+  original_filename VARCHAR(255)
+  mime_type VARCHAR(100)
+  file_size BIGINT
+  s3_key VARCHAR(500)
+  public_url VARCHAR(1000)
+  status ENUM(pending, processing, completed, failed)
+  error_message VARCHAR(500)
+  meta JSONB                          -- width, height, duration, format
+  created_at TIMESTAMPTZ
+  INDEX(org_id, status)
+```
+
+### 4.10 Observability Tables
+```
+message_events                        -- raw event log for analytics
+  id UUID PK
+  org_id UUID
+  message_id UUID → messages.id
+  event_type VARCHAR(50)              -- sent, delivered, read, failed, replied
+  occurred_at TIMESTAMPTZ
+  meta JSONB
+
+daily_stats                           -- pre-aggregated for dashboards
+  id UUID PK
+  org_id UUID
+  date DATE
+  messages_sent INT
+  messages_delivered INT
+  messages_read INT
+  messages_failed INT
+  campaigns_run INT
+  credits_consumed NUMERIC(12,4)
+  UNIQUE(org_id, date)
+
+audit_log
+  id UUID PK
+  org_id UUID
+  user_id UUID
+  action VARCHAR(100)                 -- tenant.suspend, credit_rate.update, campaign.delete
+  resource_type VARCHAR(50)
+  resource_id UUID
+  payload JSONB
+  ip_address VARCHAR(45)
+  created_at TIMESTAMPTZ
+  INDEX(org_id, created_at DESC)
+```
+
+---
+
+## 5. Upgrade 1 — Global Idempotency System
+
+### Problem
+Without idempotency: retries cause double-sends, double-billing, duplicate webhook processing.
+
+### Design
+
+```
+Layer 1 — Redis (fast path):
+  Key pattern: idem:{namespace}:{sha256(parts)}
+  TTL: 24 hours
+  Operation: SET NX EX (atomic check-and-set)
+  On hit: return "already processed" immediately
+
+Layer 2 — DB unique constraint (durable fallback):
+  wallet_transactions.idempotency_key UNIQUE(org_id, key)
+  messages.idempotency_key UNIQUE
+  webhook_events.idempotency_key UNIQUE(source, key)
+  On constraint violation: treat as duplicate, return success
+```
+
+### Idempotency Key Derivation
+
+| Operation | Key Components |
+|---|---|
+| Webhook event | `source + Meta entry_id + event_type` |
+| Wallet credit | `org_id + razorpay_payment_id` |
+| Wallet debit | `org_id + message_id` |
+| Message send | `org_id + phone + campaign_id + content_hash` |
+| Campaign dispatch | `campaign_id + recipient_phone` |
+
+### Flow
+```
+Request arrives with idempotency key
+  → Check Redis: key seen? → return cached result (HTTP 200)
+  → Not seen: SET NX in Redis, proceed
+  → On success: write result to Redis value
+  → On DB unique violation: idempotency satisfied, return OK
+  → On failure: DELETE Redis key (allow retry)
+```
+
+---
+
+## 6. Upgrade 2 — Atomic Billing (Two-Phase Credit System)
+
+### Problem
+Fire-and-forget billing: message fails after deduction → client loses money. Or parallel requests → balance goes negative.
+
+### States
+```
+pending     → reserved, message not yet confirmed
+confirmed   → message sent, credit consumed
+rolled_back → message failed, credit refunded
+```
+
+### Flow
+```
+1. RESERVE phase (DB transaction, row lock on wallets):
+   a. Lock wallet row (SELECT FOR UPDATE)
+   b. Check balance ≥ amount → else 402 error
+   c. INSERT wallet_transaction (status=pending)
+   d. UPDATE wallets.balance -= amount
+   e. Commit
+
+2. SEND phase:
+   → Call Meta API to send message
+
+3a. SUCCESS → CONFIRM:
+   → UPDATE wallet_transaction SET status=confirmed
+
+3b. FAILURE → ROLLBACK:
+   → UPDATE wallets.balance += amount (inside new transaction)
+   → UPDATE wallet_transaction SET status=rolled_back
+   → Delete Redis idempotency key (allow retry)
+```
+
+### Concurrent Safety
+- `SELECT FOR UPDATE` on wallets row prevents concurrent over-deduction
+- `UNIQUE(org_id, idempotency_key)` on transactions prevents double-reserve
+- All balance math happens inside PostgreSQL transactions — no Python arithmetic on fetched values
+
+---
+
+## 7. Upgrade 3 — Celery Queue Segregation
+
+### Queue Architecture
+```
+campaign_queue   → Bulk message dispatch (high volume, rate-limited)
+message_queue    → Single message sends (low latency priority)
+webhook_queue    → Inbound event processing (must not back up)
+billing_queue    → Razorpay events, invoice gen, balance alerts
+media_queue      → S3 upload + metadata extraction (CPU-bound)
+analytics_queue  → Stats aggregation (low priority)
+```
+
+### Why Segregate?
+- Campaign dispatch (thousands of msgs) must never block webhook processing
+- Billing tasks run with `prefetch=1` — never batch-process payments
+- Media tasks are CPU/IO-bound — isolated to prevent starving message workers
+- Webhook queue: dedicated worker always running, no competition
+
+### Retry Policies Per Queue
+```
+campaign_queue:
+  max_retries: 3
+  backoff: exponential (30s → 60s → 120s)
+  acks_late: TRUE (message stays in queue until task completes)
+
+message_queue:
+  max_retries: 5
+  backoff: exponential (10s → 30s → 90s → 270s → 810s)
+  acks_late: TRUE
+
+webhook_queue:
+  max_retries: 5
+  backoff: fixed 60s (Meta expects consistent retry timing)
+  acks_late: TRUE
+
+billing_queue:
+  max_retries: 3
+  backoff: exponential (60s → 180s → 540s)
+  prefetch: 1 (never parallel-process billing)
+  acks_late: TRUE
+
+media_queue:
+  max_retries: 3
+  backoff: exponential
+  acks_late: TRUE
+```
+
+### Dead Letter Handling
+- After max_retries: task moved to `{queue}_dlq` (dead letter queue)
+- Celery Beat scans DLQs every hour → admin notification
+- Admin can inspect and requeue from admin panel
+
+---
+
+## 8. Upgrade 4 — Webhook Reliability System
+
+### Problem
+Meta requires HTTP 200 within 5 seconds. Processing takes longer. Any error = Meta retries 3× = duplicate processing risk.
+
+### Design
+```
+Step 1 — RECEIVE (< 200ms):
+  → Verify X-Hub-Signature-256 (HMAC-SHA256)
+  → Extract Meta's entry.id as idempotency key
+  → Check Redis idempotency (skip if already seen)
+  → INSERT into webhook_events (processed=FALSE)
+  → Return HTTP 200 immediately
+
+Step 2 — PROCESS (async, Celery):
+  → Worker picks up event by ID
+  → Parse payload: message / status_update / template_status
+  → Dispatch to correct handler:
+      inbound message → create contact/conversation/message
+      status update   → update message.status + campaign counts
+      template status → update template.status + notify org
+  → On success: UPDATE webhook_events SET processed=TRUE
+  → On failure: UPDATE retry_count++, last_error=...
+               → retry via Celery backoff
+
+Step 3 — BEAT RETRY SCANNER (every 60s):
+  → SELECT * FROM webhook_events WHERE processed=FALSE AND retry_count < 5
+  → Re-enqueue each (Celery already handles backoff)
+  → Events with retry_count >= 5: alert admin
+```
+
+### Idempotency in Webhook Processing
+- `webhook_events.idempotency_key` unique constraint: DB-level guarantee
+- Redis check: fast-path dedup before DB write
+- Each handler is idempotent: "upsert contact" not "insert contact"
+
+---
+
+## 9. Upgrade 5 — Observability
+
+### Structured Logging
+```
+Every log line (JSON):
+{
+  "timestamp": "2026-03-20T14:00:00Z",
+  "level": "INFO",
+  "message": "message.sent",
+  "request_id": "uuid",         ← injected by RequestContextMiddleware
+  "org_id": "uuid",             ← injected by TenantMiddleware
+  "module": "whatsapp_service",
+  "function": "send_template",
+  "wa_message_id": "...",
+  "cost_credits": 2.00
+}
+
+Log sinks:
+  stdout → collected by Docker / CloudWatch
+  file   → /logs/wmsg.log (rotation: 100MB, retention: 30 days, gzip)
+```
+
+### Prometheus Metrics
+```
+# API layer
+wmsg_request_duration_seconds{method, endpoint, status}  (histogram)
+wmsg_requests_total{method, endpoint}                     (counter)
+
+# Messaging
+wmsg_messages_sent_total{org_id, message_type, status}   (counter)
+wmsg_messages_per_second{phone_number_id}                 (gauge)
+wmsg_meta_api_errors_total{error_code}                    (counter)
+
+# Billing
+wmsg_billing_deductions_total{org_id, status}             (counter)
+  status: confirmed | rolled_back
+wmsg_wallet_balance_inr{org_id}                           (gauge)
+
+# Webhooks
+wmsg_webhooks_received_total{source, event_type}          (counter)
+wmsg_webhook_failures_total{source, event_type}           (counter)
+wmsg_webhook_queue_depth                                   (gauge)
+
+# Campaigns
+wmsg_campaign_dispatch_rate{campaign_id}                  (gauge)
+wmsg_campaigns_completed_total{org_id}                    (counter)
+
+# Workers
+wmsg_celery_task_duration{queue, task_name}               (histogram)
+wmsg_celery_task_failures{queue, task_name}               (counter)
+```
+
+### OpenTelemetry Tracing
+```
+Auto-instrumented:
+  FastAPI   → every request generates a span
+  SQLAlchemy → every query is a child span
+  Redis     → every command is a child span
+  httpx     → Meta API calls are child spans
+
+Trace example for "send campaign message":
+  POST /api/v1/messages/send [root span]
+    ├── db: SELECT wallets FOR UPDATE
+    ├── db: INSERT wallet_transactions
+    ├── db: UPDATE wallets.balance
+    ├── http: POST graph.facebook.com/messages
+    └── db: UPDATE wallet_transactions SET confirmed
+
+Export: OTLP → Jaeger (dev) / Grafana Tempo (prod)
+```
+
+### Grafana Dashboards (Panels to Build)
+- Message delivery funnel: sent → delivered → read
+- Wallet balance heatmap across tenants
+- Webhook processing lag (received_at → processed_at)
+- Campaign dispatch rate (msgs/sec)
+- API latency P50/P95/P99 per endpoint
+- Celery queue depths
+
+---
+
+## 10. Upgrade 6 — Conversation Locking
+
+### Problem
+Human agent has conversation open. Bot automation also triggers a reply. Client gets two messages — one from bot, one from agent. Looks broken.
+
+### Lock Architecture
+```
+Two-layer lock:
+
+Layer 1 — Redis (fast, auto-expire):
+  Key:   conv_lock:{conversation_id}
+  Value: user_id
+  TTL:   300 seconds (5 minutes)
+  SET NX EX — atomic acquire
+
+Layer 2 — DB state (durable):
+  conversations.locked_by      UUID → users.id
+  conversations.locked_at      TIMESTAMPTZ
+  conversations.lock_expires_at TIMESTAMPTZ
+```
+
+### Lock Flow
+```
+Agent opens conversation in inbox:
+  → Acquire Redis lock (SET NX EX 300)
+  → Update DB: locked_by=user_id, lock_expires_at=now+5min
+  → WebSocket event: notify other agents "conversation locked by [name]"
+
+Bot automation triggers:
+  → automation_service checks: is_locked_by_human(conversation_id)?
+    → Check Redis first (fast)
+    → Fallback to DB (lock_expires_at > NOW())
+  → If locked: SKIP bot reply (bot stays silent)
+  → If not locked: bot can reply
+
+Agent closes conversation:
+  → Release Redis key (Lua script: check value before delete)
+  → Update DB: locked_by=NULL, locked_at=NULL
+
+Auto-expiry:
+  → Redis TTL expires automatically (no orphaned locks)
+  → Beat task every 5 min: clear DB rows where lock_expires_at < NOW()
+
+Edge cases:
+  → Reload/crash: lock auto-expires (TTL)
+  → Agent reconnects within TTL: RE-acquire (extend TTL)
+  → Two agents same conversation: second SET NX fails → shown "locked by [name]"
+```
+
+---
+
+## 11. Upgrade 7 — Async Media Processing
+
+### Problem
+Large file uploads block the API thread. S3 upload can take seconds. Metadata extraction (image dimensions, video thumbnails) is CPU-bound.
+
+### Flow
+```
+Step 1 — UPLOAD (< 100ms response):
+  POST /api/v1/media/upload  (multipart)
+  → Save file to /tmp/{uuid}_{filename}
+  → INSERT media_assets (status=pending)
+  → Enqueue process_media_upload.delay(asset_id, temp_path)
+  → Return: {"asset_id": "...", "status": "pending"}
+
+Step 2 — PROCESS (Celery, media_queue):
+  → UPDATE status=processing
+  → Upload to S3: s3://bucket/media/{org_id}/{asset_id}/{filename}
+  → Extract metadata:
+      image: width, height, format (Pillow)
+      video: duration, codec (ffprobe)
+      document: page_count (pdfplumber)
+  → UPDATE status=completed, s3_key=..., public_url=..., meta={...}
+  → DELETE temp file
+  → On error: UPDATE status=failed, error_message=...
+             → Celery retry (max 3)
+
+Step 3 — POLL (Frontend):
+  GET /api/v1/media/{asset_id}/status
+  → Returns: {status, url, error}
+  → Frontend polls every 1s until status=completed or failed
+  → Or: WebSocket event pushed on completion (preferred)
+```
+
+### S3 Key Structure
+```
+media/{org_id}/{asset_id}/{original_filename}
+
+Access pattern:
+  Public CDN URL: https://cdn.tiercemsg.com/media/{org_id}/{asset_id}/{filename}
+  Or presigned S3 URL (for private files)
+```
+
+---
+
+## 12. Bonus Features
+
+### Redis Distributed Lock (Cross-Service)
+```
+Use cases:
+  Campaign dispatch: prevent double-launch of same campaign
+  Template submission: prevent duplicate Meta API calls
+  Wallet recharge: prevent concurrent Razorpay order creation
+
+Pattern:
+  Lock key:  lock:{resource}:{id}
+  Lock value: {worker_uuid}         (must own the lock to release)
+  TTL:       30 seconds             (auto-releases on crash)
+  Acquire:   SET NX EX (atomic)
+  Release:   Lua script (check value, then delete — atomic)
+  Retry:     3 attempts, 500ms apart → raise if cannot acquire
+```
+
+### Per-Org API Rate Limiting
+```
+Algorithm: Sliding window (Redis sorted set)
+
+Key:    ratelimit:{action}:{org_id}
+Entry:  score=timestamp, member=timestamp_nanoseconds
+
+Per action limits (configurable per plan):
+  api_calls:        1000 / minute
+  message_send:     500 / minute
+  campaign_create:  10 / hour
+  csv_upload:       5 / hour
+
+Meta send rate:
+  meta_send:{phone_number_id}:  80 / second  (Meta hard limit)
+
+On exceed: HTTP 429 + Retry-After header
+```
+
+### Tenacity Retry Decorator
+```
+Applied to:
+  Meta API calls:     5 retries, exponential 2s→30s, on HTTP 5xx + ConnectError
+  Razorpay API calls: 3 retries, exponential 1s→10s
+  S3 uploads:         3 retries, exponential 2s→20s
+  DB operations:      3 retries, exponential 0.5s→5s (transient PG errors)
+
+NOT applied to:
+  Billing deductions (idempotency handles retry safety)
+  Webhook handler (Celery handles retry)
+```
+
+---
+
+## 13. WhatsApp API Integration
+
+### Meta Cloud API vs BSP Decision Matrix
+
+| Factor | Meta Cloud API (Direct) | BSP (Twilio, 360Dialog, Gupshup) |
+|---|---|---|
+| Cost per conversation | Base Meta price | Meta price + 20–50% BSP markup |
+| Setup time | 1–2 weeks (business verification) | Same day |
+| Webhook control | Full, real-time | BSP-filtered |
+| Template management | Direct Meta API | Through BSP portal |
+| Support | Meta (slow) | BSP (faster) |
+| Rate limits | Meta limits | Same (BSP doesn't add capacity) |
+| Scalability | Unlimited (with Meta approval tiers) | Capped by BSP plan |
+
+**Recommendation: Meta Cloud API directly.**
+
+Reason: You're reselling — every BSP markup percentage is direct margin loss. At scale, even 20% BSP markup on ₹2/msg = ₹0.40/msg lost on every marketing message sent by every client.
+
+### WhatsApp Pricing (India, Mar 2026)
+| Conversation Type | Meta Cost (USD) | Suggested Selling Price (INR) | Margin |
+|---|---|---|---|
+| Marketing | ~$0.0117 | ₹2.00 | ~105% |
+| Utility | ~$0.0040 | ₹0.80 | ~140% |
+| Authentication | ~$0.0034 | ₹0.60 | ~124% |
+| Service (inbound 24hr) | $0.00 | ₹0.00 | — |
+
+Note: 1 conversation = any number of messages within 24-hour window. Not per-message.
+
+### Message Send Flow
+```
+POST /api/v1/messages/send
+  → Auth + tenant context
+  → Rate limit check (per org, per phone number)
+  → Idempotency check
+  → Billing: reserve_credits (two-phase begin)
+  → whatsapp_service.send_template()
+      → httpx.post graph.facebook.com/v22.0/{phone_id}/messages
+      → Tenacity retry on 5xx/network error
+  → Save message to DB (wa_message_id, status=sent)
+  → Billing: confirm_credits
+  → Publish to Redis pub/sub → WebSocket → live inbox update
+  → Return {message_id, wa_message_id}
+```
+
+### Inbound Message Flow
+```
+Meta POST → /api/v1/webhooks/meta
+  → Verify HMAC-SHA256 signature
+  → Idempotency check (Redis + DB)
+  → Save webhook_event (processed=FALSE)
+  → Return HTTP 200
+
+Celery (webhook_queue):
+  → Parse payload type: message | status | template_status
+  → If message:
+      Upsert contact (phone → org's contacts)
+      Find/create conversation (check 24hr session)
+      Save message to messages table
+      Check automation triggers (keyword match → flow)
+      If conversation locked_by human: skip bot
+      Else: check flows for auto-reply
+      Publish to Redis → agent inbox WebSocket
+  → If status update:
+      Update messages.status, delivered_at, read_at
+      Update campaign_recipients.status
+      Update campaigns.delivered_count / read_count
+  → Mark webhook_event processed=TRUE
+```
+
+---
+
+## 14. Billing System Detail
+
+### Margin Management (Admin Panel)
+```
+Admin sets in credit_rates table:
+  conversation_type = MARKETING
+  country_code = IN
+  meta_cost_usd = 0.0117     ← updated monthly from Meta invoice
+  selling_price_inr = 2.00   ← what clients pay
+  usd_to_inr_rate = 83.5     ← updated weekly
+
+System auto-calculates margin_percent for display.
+Admin can set per-tenant overrides (enterprise discounts):
+  org_id = specific_client → custom selling_price_inr
+```
+
+### Razorpay Integration Flow
+```
+Client clicks "Add ₹1000":
+  → POST /billing/recharge {amount: 1000}
+  → Create Razorpay order (amount in paise)
+  → Return order_id to frontend
+
+Frontend:
+  → Razorpay checkout widget
+  → Client pays
+  → Razorpay fires payment.captured webhook
+
+Backend (billing_queue):
+  → Verify Razorpay webhook signature (HMAC-SHA256)
+  → Idempotency check: org_id + razorpay_payment_id
+  → Credit wallet (two-phase: idempotent credit)
+  → Generate invoice (PDF via WeasyPrint)
+  → Email invoice to org_admin
+  → Push WebSocket event: "Wallet credited ₹1000"
+```
+
+---
+
+## 15. Deployment Architecture
+
+### Docker Compose (Development)
+```
+services:
+  postgres     :5432   PostgreSQL 16
+  redis        :6379   Redis 7.2
+  backend      :8000   FastAPI (uvicorn --reload)
+  celery_campaign       workers: campaign_queue
+  celery_message        workers: message_queue
+  celery_webhook        workers: webhook_queue (dedicated)
+  celery_billing        workers: billing_queue (prefetch=1)
+  celery_media          workers: media_queue
+  celery_beat           scheduler
+  flower        :5555  Celery monitoring UI
+  frontend     :3000   Next.js (dev server)
+  nginx        :80     Reverse proxy
+  prometheus   :9090   Metrics scraping
+  grafana      :3001   Dashboards
+  jaeger       :16686  Traces (dev)
+```
+
+### AWS Production Architecture
+```
+Route 53 → CloudFront (CDN, frontend + media CDN)
+         → ALB (Application Load Balancer)
+              → ECS Fargate: backend (2–8 tasks, auto-scale on CPU/request rate)
+              → ECS Fargate: celery workers per queue (2 tasks each)
+              → ECS Fargate: celery_beat (1 task, no scaling)
+
+RDS PostgreSQL 16 (Multi-AZ, read replica for analytics queries)
+ElastiCache Redis (Cluster mode: 3 primary shards)
+S3 (media storage) + CloudFront (media CDN)
+SES (transactional email: invoices, alerts)
+Secrets Manager (Meta tokens, Razorpay keys, DB password)
+CloudWatch (logs + alarms + dashboards)
+ECR (Docker image registry)
+```
+
+### CI/CD Pipeline (GitHub Actions)
+```
+On push to main:
+  1. test     → pytest (min 80% coverage)
+  2. lint     → ruff + mypy
+  3. build    → docker build + push to ECR
+  4. migrate  → alembic upgrade head (staging)
+  5. deploy   → ECS rolling update (0 downtime)
+  6. smoke    → health check endpoints pass
+
+On PR:
+  1. test + lint
+  2. preview deploy to staging environment
+```
+
+---
+
+## 16. Security Design
+
+| Area | Mechanism |
+|---|---|
+| Multi-tenant isolation | `org_id` on every query, SQLAlchemy event listener auto-appends WHERE |
+| API auth | JWT (HS256), 15min access token + 7-day refresh |
+| RBAC | `user_role` enum; `Depends(require_role(...))` on protected routes |
+| Webhook signatures | HMAC-SHA256 verified before any processing (Meta + Razorpay) |
+| Token storage | WABA access tokens: Fernet-encrypted at rest in DB |
+| Secrets | AWS Secrets Manager (never in .env in prod) |
+| Rate limiting | Nginx (global) + Redis sliding window (per-org) |
+| SQL injection | SQLAlchemy ORM + parameterized queries only — no raw SQL |
+| Password | bcrypt, cost factor 12 |
+| Audit | All admin actions → audit_log table |
+| PDPA/GDPR | Opt-in tracking, contact deletion cascade, data export endpoint |
+| PII | Phone numbers searchable but stored with org-level encryption |
+
+---
+
+## 17. MVP Rollout Phases
+
+### Phase 1 — Foundation (Weeks 1–4)
+- Docker Compose dev environment
+- PostgreSQL schema + Alembic migrations (all 7 upgrades baked in from start)
+- FastAPI app factory + all middleware (logging, metrics, tracing, tenant context)
+- Auth service (JWT, RBAC, login/register/refresh)
+- Tenant + User CRUD
+- Observability stack running (Prometheus + Grafana + Jaeger)
+
+### Phase 2 — Core Messaging (Weeks 5–8)
+- Meta Cloud API client with tenacity retry
+- Send text + template messages (with idempotency + two-phase billing)
+- Webhook receiver (save-first, process-async pattern)
+- Inbound message processing (Celery webhook_queue)
+- Delivery status updates
+- 2-way chat inbox UI + WebSocket real-time
+
+### Phase 3 — Campaigns (Weeks 9–11)
+- Campaign creation + CSV contact upload
+- Rate-limited bulk dispatch (80 msg/sec per phone, Redis token bucket)
+- Campaign analytics: delivery funnel, read rate
+- Template management + Meta submission flow
+- Distributed lock: prevent double-launch
+
+### Phase 4 — Billing (Weeks 12–14)
+- Wallet system + credit_rates (global + per-tenant)
+- Two-phase atomic billing (full implementation)
+- Razorpay integration (order + webhook)
+- PDF invoice generation
+- Low balance alerts + auto-recharge
+- Billing dashboard UI
+
+### Phase 5 — Automation + Bot (Weeks 15–18)
+- Rule-based keyword flow engine
+- Visual flow builder UI (drag-drop)
+- Conversation locking (human vs. bot)
+- LLM integration (GPT-4o-mini for cost efficiency)
+- Contact segmentation + tags
+- Async media upload system
+
+### Phase 6 — Admin + Production (Weeks 19–21)
+- Super-admin panel (tenant management, pricing, usage, revenue)
+- Per-tenant custom pricing overrides
+- AWS deployment (ECS + RDS + ElastiCache)
+- CI/CD pipeline
+- Load testing (Locust: 80 msg/sec target)
+
+### Phase 7 — Scale + Differentiate (Month 6+)
+- Multi-WABA per tenant
+- White-label + custom domain per tenant
+- AI agent-assist in inbox (LLM suggests replies)
+- Advanced analytics (cohort, revenue attribution)
+- Client-facing API + webhook forwarding
+- Mobile app (React Native)
+
+---
+
+## 18. Team Structure
+
+| Role | Count | Focus |
+|---|---|---|
+| Backend Engineer (FastAPI + Python) | 1–2 | Core services, Meta API, Celery, billing |
+| Frontend Engineer (Next.js) | 1 | Dashboard, inbox UI, flow builder |
+| DevOps (part-time) | 1 | Docker, AWS, CI/CD, monitoring |
+| QA (part-time) | 1 | Integration tests, load testing |
+| Product / AI (Meet) | 1 | Requirements, LLM integration, client onboarding |
+
+**MVP with 2 people:** Meet (backend + AI) + 1 frontend dev is sufficient for Phase 1–4.
+
+---
+
+## 19. Improvements Over AISensy
+
+| Feature | AISensy | TierceMsg |
+|---|---|---|
+| LLM chatbot | Basic keyword bot | GPT-4o with 10-message context window, intent classification |
+| Flow builder | Simple tree | Visual drag-drop with conditions, delays, webhook calls |
+| Analytics | Basic delivery stats | Real-time funnel, cohort analysis, revenue attribution |
+| Multi-WABA | Limited | Multiple WABAs + phone numbers per tenant |
+| Margin control | Fixed pricing tiers | Dynamic per-tenant pricing, per-country rates |
+| Billing safety | Unknown | Two-phase atomic: zero double-charge risk |
+| Idempotency | Unknown | Global: webhooks, messages, billing all idempotent |
+| Auto-recharge | No | Razorpay auto-pay on low balance |
+| Observability | None | Full: Prometheus + Grafana + OpenTelemetry |
+| Conversation locking | No | Human-agent lock prevents bot interference |
+| Media processing | Sync | Async Celery pipeline with status tracking |
+| White-label | Partial | Full: custom domain + branding per tenant |
+| Rate limiting | Unknown | Per-org sliding window + Meta API token bucket |
+| Webhook reliability | Unknown | Save-first + retry scanner + DLQ |

@@ -1,0 +1,51 @@
+<persisted-output>
+Output too large (53.3KB). Full output saved to: C:\Users\LENOVO\.claude\projects\d--WORK-whatsapp-dash\d4b2a5df-c628-4b95-82cc-cab171da16fe\tool-results\ba2vuhfmk.txt
+
+Preview (first 2KB):
+ve       BOOLEAN DEFAULT TRUE,
+    verified_name   VARCHAR(255),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_phone_org ON phone_numbers(org_id);
+
+-- ============================================================
+-- MESSAGE TEMPLATES
+-- ============================================================
+CREATE TYPE template_category AS ENUM ('MARKETING', 'UTILITY', 'AUTHENTICATION');
+CREATE TYPE template_status AS ENUM ('PENDING', 'APPROVED', 'REJECTED', 'PAUSED');
+
+CREATE TABLE message_templates (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    waba_id         UUID REFERENCES waba_accounts(id),
+    meta_template_id VARCHAR(100),                 -- Meta's template ID after approval
+    name            VARCHAR(512) NOT NULL,
+    category        template_category NOT NULL,
+    language        VARCHAR(10) DEFAULT 'en',
+    status          template_status DEFAULT 'PENDING',
+    components      JSONB NOT NULL,                -- Full Meta template JSON
+    rejection_reason TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(org_id, name, language)
+);
+
+CREATE INDEX idx_tmpl_org ON message_templates(org_id);
+CREATE INDEX idx_tmpl_status ON message_templates(org_id, status);
+
+-- ============================================================
+-- CONTACTS & CRM
+-- ============================================================
+CREATE TABLE contacts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    phone           VARCHAR(20) NOT NULL,           -- E.164 format: +91XXXXXXXXXX
+    name            VARCHAR(255),
+    email           VARCHAR(255),
+    avatar_url      TEXT,
+    language        VARCHAR(10) DEFAULT 'en',
+    is_opted_in     BOOLEAN DEFAULT TRUE,           -- WhatsApp opt-in status
+    opted_in_at     TIMESTAMPTZ,
+...
+</persisted-output>

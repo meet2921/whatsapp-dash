@@ -1,0 +1,197 @@
+Good. The environment has Python 3.13, FastAPI 0.129, Celery 5.3, SQLAlchemy 2.0, Pydantic v2, asyncpg, alembic, httpx, redis, passlib, python-jose, psycopg2, and Docker. Now I'll design the full plan.
+
+---
+
+# WhatsApp Business SaaS Platform - Full Implementation Plan
+
+**Developer:** Meet Bhayani, Tierce India Pvt Ltd
+**Platform Name (suggested):** TierceMsg (internal codename: `wmsg`)
+**Date:** March 2026
+**Purpose:** Internal use + multi-tenant reseller SaaS
+
+---
+
+## 1. System Architecture
+
+### High-Level ASCII Architecture
+
+```
+                          ┌─────────────────────────────────────────────┐
+                          │               EXTERNAL SERVICES              │
+                          │  Meta Cloud API  │  Razorpay  │  AWS S3/R2  │
+                          └────────┬─────────────┬──────────────┬────────┘
+                                   │             │              │
+┌──────────────────────────────────▼─────────────▼──────────────▼────────────────────┐
+│                              INGRESS / NGINX / TRAEFIK                              │
+│                    TLS Termination, Rate Limiting, Routing                          │
+└────┬──────────────────────────────────────┬───────────────────────────────────┬────┘
+     │                                      │                                   │
+     ▼                                      ▼                                   ▼
+┌─────────────┐                  ┌──────────────────┐                ┌─────────────────┐
+│  Next.js    │                  │  FastAPI Gateway  │                │  Webhook        │
+│  Frontend   │ ─── REST/WS ───► │  (API Gateway)    │                │  Receiver       │
+│  (Port 3000)│                  │  (Port 8000)      │                │  (Port 8001)    │
+└─────────────┘                  └────────┬─────────┘                └────────┬────────┘
+                                          │                                   │
+                    ┌─────────────────────┼───────────────────────┐           │
+                    │                     │                       │           │
+                    ▼                     ▼                       ▼           ▼
+          ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐
+          │  Auth Service    │  │  Tenant Service   │  │   WhatsApp Message Service   │
+          │  JWT + RBAC      │  │  Org/User Mgmt   │  │   Send/Receive/Webhook       │
+          └──────────────────┘  └──────────────────┘  └──────────────────────────────┘
+                    │                     │                       │
+          ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐
+          │  Campaign Svc    │  │  Contact/CRM Svc  │  │   Billing/Wallet Service     │
+          │  Schedule+Send   │  │  Tags,Segments    │  │   Razorpay + Credits         │
+          └──────────────────┘  └──────────────────┘  └──────────────────────────────┘
+                    │                     │                       │
+          ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐
+          │  Automation Svc  │  │  Analytics Svc    │  │   Admin Service              │
+          │  Flows, LLM Bot  │  │  Events,Metrics   │  │   Platform-wide ops          │
+          └──────────────────┘  └──────────────────┘  └──────────────────────────────┘
+                                          │
+               ┌──────────────────────────┴──────────────────────────┐
+               │                   DATA LAYER                        │
+               │  PostgreSQL 16    │  Redis 7.2   │  S3/R2 (Media)  │
+               └──────────────────────────────────────────────────────┘
+                                          │
+               ┌──────────────────────────┴──────────────────────────┐
+               │                  ASYNC WORKERS                      │
+               │   Celery Beat (Scheduler)  │  Celery Workers x4     │
+               │   Queues: campaigns, msgs, billing, analytics       │
+               └──────────────────────────────────────────────────────┘
+```
+
+### Architecture Decision: Modular Monolith, Not Microservices
+
+For a startup team (1-3 devs), a **modular monolith** is recommended. The code is organized as independent modules (services) within one FastAPI process, sharing the same DB, but each module has clean boundaries. This means:
+
+- Zero inter-service networking overhead
+- Single deployment unit early on
+- Can extract into true microservices later by splitting along existing module boundaries
+- All modules share connection pools (PostgreSQL, Redis)
+
+---
+
+## 2. Tech Stack (Exact Versions)
+
+### Backend
+
+| Library | Version | Reason |
+|---|---|---|
+| Python | 3.13 | Latest stable, pattern matching, asyncio improvements |
+| FastAPI | 0.129.0 | Already installed, async-native, OpenAPI auto-docs |
+| SQLAlchemy | 2.0.46 | Already installed, async engine, mapped_column API |
+| Alembic | 1.18.4 | DB migrations, auto-generate from models |
+| asyncpg | 0.31.0 | Async PostgreSQL driver (faster than psycopg3 async) |
+| psycopg2-binary | 2.9.11 | Sync driver for Alembic migrations |
+| Pydantic | 2.12.5 | Request/response validation, settings management |
+| pydantic-settings | 2.13.1 | Env-based config |
+| Celery | 5.3.0 | Task queue, scheduling, beat scheduler |
+| redis | 7.2.0 | Celery broker + cache + pub/sub for WebSocket |
+| httpx | 0.28.1 | Async HTTP client for Meta API calls |
+| python-jose | 3.5.0 | JWT tokens |
+| passlib | 1.7.4 | Password hashing (bcrypt) |
+| razorpay | latest | Payment gateway (install needed) |
+| openai | latest | LLM integration (GPT-4o for bot flows) |
+| boto3 | latest | S3/R2 media upload |
+| Pillow | latest | Image thumbnail generation |
+| python-multipart | latest | File upload support in FastAPI |
+| celery-redbeat | latest | Redis-backed beat scheduler (persistent) |
+| flower | latest | Celery monitoring |
+| prometheus-client | latest | Metrics |
+| loguru | latest | Structured logging |
+| tenacity | latest | Retry logic for Meta API calls |
+| jinja2 | latest | Invoice HTML templates |
+| weasyprint | latest | PDF invoice generation |
+
+### Frontend
+
+| Library | Version | Reason |
+|---|---|---|
+| Next.js | 15.x | App Router, Server Components, streaming |
+| React | 19.x | Latest with concurrent features |
+| TypeScript | 5.x | Type safety throughout |
+| Tailwind CSS | 4.x | Utility-first styling |
+| shadcn/ui | latest | Accessible component library (Radix-based) |
+| Zustand | 5.x | Lightweight global state |
+| TanStack Query | 5.x | Server state, caching, mutations |
+| TanStack Table | 8.x | Data tables for campaigns/contacts |
+| React Hook Form | 7.x | Form management |
+| Zod | 3.x | Schema validation (shared with backend) |
+| Socket.io-client | 4.x | Real-time chat inbox |
+| Recharts | 2.x | Analytics charts |
+| date-fns | 3.x | Date handling |
+| @radix-ui/* | latest | Primitives for shadcn |
+| react-dropzone | latest | Media file uploads |
+| react-pdf | latest | Invoice PDF viewer |
+
+### Infrastructure
+
+| Tool | Version | Reason |
+|---|---|---|
+| PostgreSQL | 16 | JSONB, full-text search, row-level security |
+| Redis | 7.2 | Celery broker + result backend + cache + pub/sub |
+| Nginx | latest | Reverse proxy, static serving |
+| Docker | 29.x | Containerization |
+| Docker Compose | 2.x | Local dev orchestration |
+
+---
+
+## 3. Project Folder Structure
+
+```
+d:\WORK\whatsapp-dash\
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                    # FastAPI app factory, router registration
+│   │   ├── config.py                  # Pydantic settings (env-based)
+│   │   ├── database.py                # SQLAlchemy async engine + session factory
+│   │   ├── redis_client.py            # Redis connection pool
+│   │   ├── celery_app.py              # Celery app instance + beat schedule
+│   │   ├── dependencies.py            # FastAPI Depends: auth, tenant, db
+│   │   │
+│   │   ├── core/
+│   │   │   ├── security.py            # JWT create/verify, password hash
+│   │   │   ├── exceptions.py          # Custom HTTP exceptions
+│   │   │   ├── middleware.py          # TenantMiddleware, LoggingMiddleware
+│   │   │   ├── pagination.py          # Cursor + offset pagination
+│   │   │   └── utils.py              # Phone number normalize, slugify
+│   │   │
+│   │   ├── models/                    # SQLAlchemy ORM models (all tables)
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py                # Base declarative, TimestampMixin, TenantMixin
+│   │   │   ├── tenant.py              # Organization, Plan, Subscription
+│   │   │   ├── user.py                # User, Role, Permission
+│   │   │   ├── whatsapp.py            # WABAAccount, PhoneNumber, MessageTemplate
+│   │   │   ├── message.py             # Message, MessageMedia, Conversation
+│   │   │   ├── contact.py             # Contact, Tag, Segment, ContactTag
+│   │   │   ├── campaign.py            # Campaign, CampaignRecipient, CampaignAnalytics
+│   │   │   ├── automation.py          # Flow, FlowStep, FlowTrigger, FlowExecution
+│   │   │   ├── billing.py             # Wallet, WalletTransaction, Invoice, CreditRate
+│   │   │   ├── webhook.py             # WebhookLog, WebhookEvent
+│   │   │   └── analytics.py          # MessageEvent, DailyStats
+│   │   │
+│   │   ├── schemas/                   # Pydantic v2 request/response schemas
+│   │   │   ├── auth.py
+│   │   │   ├── tenant.py
+│   │   │   ├── user.py
+│   │   │   ├── whatsapp.py
+│   │   │   ├── message.py
+│   │   │   ├── contact.py
+│   │   │   ├── campaign.py
+│   │   │   ├── automation.py
+│   │   │   ├── billing.py
+│   │   │   └── analytics.py
+│   │   │
+│   │   ├── api/                       # FastAPI routers
+│   │   │   ├── __init__.py
+│   │   │   ├── v1/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── auth.py            # /auth/*
+│   │   │   │   ├── tenants.py         # /tenants/*
+│   │   │   │   ├── users.py           # /users/*
+│   │   │   │   ├── whatsapp.py        # /whatsapp/*
+│   │   │   │   ├── messages

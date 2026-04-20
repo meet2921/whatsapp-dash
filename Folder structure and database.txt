@@ -1,0 +1,330 @@
+.py        # /messages/*
+│   │   │   │   ├── conversations.py   # /conversations/*
+│   │   │   │   ├── contacts.py        # /contacts/*
+│   │   │   │   ├── campaigns.py       # /campaigns/*
+│   │   │   │   ├── automation.py      # /automation/*
+│   │   │   │   ├── billing.py         # /billing/*
+│   │   │   │   ├── analytics.py       # /analytics/*
+│   │   │   │   ├── webhooks.py        # /webhooks/* (Meta callbacks)
+│   │   │   │   ├── admin.py           # /admin/* (super-admin only)
+│   │   │   │   └── media.py           # /media/* (upload/download)
+│   │   │
+│   │   ├── services/                  # Business logic layer
+│   │   │   ├── auth_service.py
+│   │   │   ├── tenant_service.py
+│   │   │   ├── user_service.py
+│   │   │   ├── whatsapp_service.py    # Meta API wrapper (core)
+│   │   │   ├── message_service.py
+│   │   │   ├── conversation_service.py
+│   │   │   ├── contact_service.py
+│   │   │   ├── campaign_service.py
+│   │   │   ├── automation_service.py
+│   │   │   ├── bot_service.py         # LLM/rule-based bot engine
+│   │   │   ├── billing_service.py     # Wallet, credits, Razorpay
+│   │   │   ├── analytics_service.py
+│   │   │   ├── media_service.py       # S3/R2 upload
+│   │   │   ├── notification_service.py
+│   │   │   └── invoice_service.py     # PDF generation
+│   │   │
+│   │   ├── tasks/                     # Celery tasks
+│   │   │   ├── __init__.py
+│   │   │   ├── campaign_tasks.py      # Bulk message dispatch
+│   │   │   ├── message_tasks.py       # Single message retry logic
+│   │   │   ├── billing_tasks.py       # Daily billing, invoice generation
+│   │   │   ├── analytics_tasks.py     # Aggregate stats
+│   │   │   ├── automation_tasks.py    # Flow execution
+│   │   │   └── maintenance_tasks.py   # Cleanup, archival
+│   │   │
+│   │   ├── integrations/
+│   │   │   ├── meta/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── client.py          # Meta Graph API async client
+│   │   │   │   ├── webhook_parser.py  # Parse incoming webhook payloads
+│   │   │   │   ├── template_manager.py
+│   │   │   │   └── models.py          # Meta API response types
+│   │   │   ├── razorpay/
+│   │   │   │   ├── client.py
+│   │   │   │   └── webhook_handler.py
+│   │   │   ├── llm/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── openai_client.py
+│   │   │   │   ├── prompt_builder.py
+│   │   │   │   └── intent_classifier.py
+│   │   │   └── storage/
+│   │   │       └── s3_client.py
+│   │   │
+│   │   └── websockets/
+│   │       ├── __init__.py
+│   │       ├── manager.py             # WebSocket connection manager (Redis pub/sub)
+│   │       └── handlers.py            # WS event handlers
+│   │
+│   ├── alembic/
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions/                  # Migration files
+│   │
+│   ├── tests/
+│   │   ├── conftest.py
+│   │   ├── unit/
+│   │   ├── integration/
+│   │   └── fixtures/
+│   │
+│   ├── scripts/
+│   │   ├── seed_db.py                 # Initial data seeding
+│   │   ├── create_superadmin.py
+│   │   └── migrate_and_seed.sh
+│   │
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── requirements-dev.txt
+│   ├── .env.example
+│   └── pyproject.toml
+│
+├── frontend/
+│   ├── src/
+│   │   ├── app/                       # Next.js App Router
+│   │   │   ├── layout.tsx
+│   │   │   ├── page.tsx               # Landing/redirect
+│   │   │   ├── (auth)/
+│   │   │   │   ├── login/page.tsx
+│   │   │   │   ├── register/page.tsx
+│   │   │   │   └── forgot-password/page.tsx
+│   │   │   ├── (dashboard)/
+│   │   │   │   ├── layout.tsx         # Sidebar + TopNav
+│   │   │   │   ├── overview/page.tsx
+│   │   │   │   ├── inbox/
+│   │   │   │   │   ├── page.tsx       # Conversation list
+│   │   │   │   │   └── [id]/page.tsx  # Single conversation
+│   │   │   │   ├── campaigns/
+│   │   │   │   │   ├── page.tsx
+│   │   │   │   │   ├── new/page.tsx
+│   │   │   │   │   └── [id]/page.tsx
+│   │   │   │   ├── contacts/
+│   │   │   │   │   ├── page.tsx
+│   │   │   │   │   └── [id]/page.tsx
+│   │   │   │   ├── templates/page.tsx
+│   │   │   │   ├── automation/
+│   │   │   │   │   ├── page.tsx
+│   │   │   │   │   └── [id]/page.tsx  # Flow builder
+│   │   │   │   ├── analytics/page.tsx
+│   │   │   │   ├── billing/
+│   │   │   │   │   ├── page.tsx
+│   │   │   │   │   └── recharge/page.tsx
+│   │   │   │   └── settings/
+│   │   │   │       ├── page.tsx
+│   │   │   │       ├── whatsapp/page.tsx
+│   │   │   │       └── team/page.tsx
+│   │   │   └── (admin)/               # Super admin panel
+│   │   │       ├── layout.tsx
+│   │   │       ├── dashboard/page.tsx
+│   │   │       ├── tenants/page.tsx
+│   │   │       ├── pricing/page.tsx
+│   │   │       ├── usage/page.tsx
+│   │   │       └── billing/page.tsx
+│   │   │
+│   │   ├── components/
+│   │   │   ├── ui/                    # shadcn/ui components
+│   │   │   ├── layout/
+│   │   │   │   ├── Sidebar.tsx
+│   │   │   │   ├── TopNav.tsx
+│   │   │   │   └── MobileNav.tsx
+│   │   │   ├── chat/
+│   │   │   │   ├── ConversationList.tsx
+│   │   │   │   ├── ChatWindow.tsx
+│   │   │   │   ├── MessageBubble.tsx
+│   │   │   │   ├── MessageInput.tsx
+│   │   │   │   └── ContactInfo.tsx
+│   │   │   ├── campaigns/
+│   │   │   │   ├── CampaignCard.tsx
+│   │   │   │   ├── CampaignForm.tsx
+│   │   │   │   ├── TemplateSelector.tsx
+│   │   │   │   └── RecipientPicker.tsx
+│   │   │   ├── automation/
+│   │   │   │   ├── FlowBuilder.tsx    # Visual drag-drop flow editor
+│   │   │   │   ├── FlowNode.tsx
+│   │   │   │   └── NodePanel.tsx
+│   │   │   ├── billing/
+│   │   │   │   ├── WalletCard.tsx
+│   │   │   │   ├── RechargeModal.tsx
+│   │   │   │   └── InvoiceList.tsx
+│   │   │   └── analytics/
+│   │   │       ├── StatsCard.tsx
+│   │   │       ├── DeliveryChart.tsx
+│   │   │       └── CampaignFunnel.tsx
+│   │   │
+│   │   ├── lib/
+│   │   │   ├── api.ts                 # Axios/fetch client with auth
+│   │   │   ├── auth.ts                # NextAuth or custom auth helpers
+│   │   │   ├── socket.ts              # Socket.io client setup
+│   │   │   └── utils.ts
+│   │   │
+│   │   ├── hooks/
+│   │   │   ├── useAuth.ts
+│   │   │   ├── useConversations.ts
+│   │   │   ├── useCampaigns.ts
+│   │   │   ├── useContacts.ts
+│   │   │   ├── useBilling.ts
+│   │   │   └── useWebSocket.ts
+│   │   │
+│   │   ├── store/
+│   │   │   ├── authStore.ts           # Zustand: user, token, tenant
+│   │   │   ├── chatStore.ts           # Active conversation, messages
+│   │   │   └── uiStore.ts             # Sidebar open, notifications
+│   │   │
+│   │   └── types/
+│   │       ├── api.ts                 # API response types
+│   │       ├── models.ts              # Domain model types
+│   │       └── whatsapp.ts            # WhatsApp message types
+│   │
+│   ├── public/
+│   ├── next.config.ts
+│   ├── tailwind.config.ts
+│   ├── tsconfig.json
+│   ├── Dockerfile
+│   └── package.json
+│
+├── infra/
+│   ├── docker/
+│   │   ├── nginx/
+│   │   │   ├── nginx.conf
+│   │   │   └── conf.d/
+│   │   │       └── default.conf
+│   │   ├── postgres/
+│   │   │   └── init.sql               # DB init, extensions
+│   │   └── redis/
+│   │       └── redis.conf
+│   │
+│   ├── docker-compose.yml             # Full dev stack
+│   ├── docker-compose.prod.yml        # Production overrides
+│   │
+│   ├── k8s/                           # Future Kubernetes
+│   │   └── README.md
+│   │
+│   └── terraform/                     # Future AWS IaC
+│       └── README.md
+│
+├── .github/
+│   └── workflows/
+│       ├── backend-ci.yml
+│       ├── frontend-ci.yml
+│       └── deploy.yml
+│
+├── docs/
+│   ├── api/                           # OpenAPI exports
+│   ├── architecture/
+│   │   └── decisions/                 # ADR files
+│   └── runbooks/
+│
+├── .env.example
+├── .gitignore
+├── Makefile                           # Dev shortcuts
+└── README.md
+```
+
+---
+
+## 4. Database Schema
+
+### All Tables with Columns, Indexes, and Relationships
+
+```sql
+-- ============================================================
+-- EXTENSIONS
+-- ============================================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";   -- full-text search
+CREATE EXTENSION IF NOT EXISTS "btree_gin"; -- composite GIN indexes
+
+-- ============================================================
+-- TENANTS (Organizations / Clients of the SaaS)
+-- ============================================================
+CREATE TABLE plans (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            VARCHAR(100) NOT NULL,          -- e.g. "Starter", "Growth", "Enterprise"
+    monthly_fee     NUMERIC(10,2) NOT NULL DEFAULT 0,
+    msg_limit       INTEGER,                        -- NULL = unlimited
+    contact_limit   INTEGER,
+    features        JSONB NOT NULL DEFAULT '{}',    -- {"automation": true, "ai_bot": false}
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE organizations (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            VARCHAR(255) NOT NULL,
+    slug            VARCHAR(100) UNIQUE NOT NULL,   -- URL-safe identifier
+    plan_id         UUID REFERENCES plans(id),
+    owner_email     VARCHAR(255) NOT NULL,
+    phone           VARCHAR(20),
+    country         VARCHAR(2) DEFAULT 'IN',
+    timezone        VARCHAR(50) DEFAULT 'Asia/Kolkata',
+    is_active       BOOLEAN DEFAULT TRUE,
+    is_suspended    BOOLEAN DEFAULT FALSE,
+    suspension_reason TEXT,
+    meta            JSONB DEFAULT '{}',             -- custom KV store
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_org_slug ON organizations(slug);
+CREATE INDEX idx_org_owner ON organizations(owner_email);
+
+-- ============================================================
+-- USERS
+-- ============================================================
+CREATE TYPE user_role AS ENUM ('super_admin', 'org_admin', 'agent', 'viewer');
+
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    email           VARCHAR(255) UNIQUE NOT NULL,
+    hashed_password VARCHAR(255),
+    full_name       VARCHAR(255) NOT NULL,
+    avatar_url      TEXT,
+    role            user_role NOT NULL DEFAULT 'agent',
+    is_active       BOOLEAN DEFAULT TRUE,
+    is_verified     BOOLEAN DEFAULT FALSE,
+    last_login      TIMESTAMPTZ,
+    preferences     JSONB DEFAULT '{}',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_org ON users(org_id);
+CREATE INDEX idx_users_email ON users(email);
+
+-- ============================================================
+-- WHATSAPP ACCOUNTS (Meta WABA)
+-- ============================================================
+CREATE TABLE waba_accounts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    waba_id         VARCHAR(100) UNIQUE NOT NULL,   -- Meta WABA ID
+    access_token    TEXT NOT NULL,                  -- System User Token (encrypted)
+    token_expires   TIMESTAMPTZ,
+    business_name   VARCHAR(255),
+    status          VARCHAR(50) DEFAULT 'active',   -- active, suspended, banned
+    webhook_secret  VARCHAR(255) NOT NULL,          -- for signature verification
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_waba_org ON waba_accounts(org_id);
+
+CREATE TABLE phone_numbers (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    waba_id         UUID REFERENCES waba_accounts(id),
+    phone_number_id VARCHAR(100) UNIQUE NOT NULL,   -- Meta Phone Number ID
+    display_number  VARCHAR(20) NOT NULL,
+    display_name    VARCHAR(255),
+    quality_rating  VARCHAR(20) DEFAULT 'GREEN',    -- GREEN, YELLOW, RED
+    messaging_limit VARCHAR(50),                    -- 1K, 10K, 100K, unlimited
+    is_acti
+
+
+For connecting WABA with the meta
+{ 
+ "access_token": "EAAXfIWUZBgwIBREVwuxp7OZBoEqQY4XnNrx1dwwzM4HFmyeFLDZBUs4hKIhabwtic8DnY1wGfpZBTlgsu7q8EjbNm1DZBbrfZBsWFy4z5FHfreZBRaqWccvPhGuCtYFpRYbcgPlnC74NkxFBZBsJ6kbpQOTzNcPuDv79bhuimMYx7lVbjA2ybZBZBxtjQ5EK6uVy5S0Bwrx1iz2GWvR1yLui8ZATw1XQk7q6f9HnZCmjcVdU", 
+ "waba_id": "936593352615580" 
+}
