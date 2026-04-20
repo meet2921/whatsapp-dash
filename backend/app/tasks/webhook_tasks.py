@@ -191,6 +191,7 @@ async def _handle_status_update(db, payload: dict) -> None:
     status_data = payload.get("status", {})
     wa_message_id = status_data.get("id", "")
     new_status = status_data.get("status", "")
+    recipient_phone = "+" + status_data.get("recipient_id", "").lstrip("+") if status_data.get("recipient_id") else None
 
     if not wa_message_id or not new_status:
         return
@@ -221,7 +222,7 @@ async def _handle_status_update(db, payload: dict) -> None:
 
     # Update campaign counters if applicable
     if msg.campaign_id and new_status in ("delivered", "read", "failed"):
-        await _update_campaign_counts(db, msg.campaign_id, new_status)
+        await _update_campaign_counts(db, msg.campaign_id, new_status, recipient_phone)
 
     await db.flush()
 
@@ -289,7 +290,7 @@ async def _handle_template_status(db, payload: dict) -> None:
 
 # ── Campaign counter update ───────────────────────────────────────────────────
 
-async def _update_campaign_counts(db, campaign_id: uuid.UUID, new_status: str) -> None:
+async def _update_campaign_counts(db, campaign_id: uuid.UUID, new_status: str, recipient_phone: str | None = None) -> None:
     from app.models.campaign import Campaign, CampaignRecipient, RecipientStatus
     from sqlalchemy import update
 
@@ -302,11 +303,16 @@ async def _update_campaign_counts(db, campaign_id: uuid.UUID, new_status: str) -
     if not recipient_status:
         return
 
-    await db.execute(
-        update(CampaignRecipient)
-        .where(CampaignRecipient.campaign_id == campaign_id)
-        .values(status=recipient_status)
-    )
+    # Update only the specific recipient, not all recipients in the campaign
+    if recipient_phone:
+        await db.execute(
+            update(CampaignRecipient)
+            .where(
+                CampaignRecipient.campaign_id == campaign_id,
+                CampaignRecipient.phone == recipient_phone,
+            )
+            .values(status=recipient_status)
+        )
 
     campaign_result = await db.execute(
         select(Campaign).where(Campaign.id == campaign_id)

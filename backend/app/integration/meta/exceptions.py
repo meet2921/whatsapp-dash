@@ -21,11 +21,13 @@ class MetaAPIError(Exception):
         self.error_type: str = err.get("type", "")
         self.error_message: str = err.get("message", str(error_body))
         # Extra detail fields Meta includes for validation errors
-        extra = " | ".join(filter(None, [
-            err.get("error_data"),
-            err.get("error_user_msg"),
-            str(err["error_subcode"]) if err.get("error_subcode") else None,
-        ]))
+        extra = " | ".join(
+            str(v) for v in [
+                err.get("error_data"),
+                err.get("error_user_msg"),
+                err.get("error_subcode"),
+            ] if v is not None
+        )
         detail = f": {extra}" if extra else ""
         super().__init__(
             f"Meta API {status_code} (code={self.error_code}, type={self.error_type}): {self.error_message}{detail}"

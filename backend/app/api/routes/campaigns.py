@@ -39,6 +39,7 @@ class CampaignCreate(BaseModel):
     template_id: uuid.UUID
     phone_number_id: uuid.UUID
     scheduled_at: datetime | None = None
+    template_variables: dict | None = None  # {"HEADER-1": "val", "BODY-1": "val", ...}
 
 
 class CampaignUpdate(BaseModel):
@@ -46,6 +47,7 @@ class CampaignUpdate(BaseModel):
     template_id: uuid.UUID | None = None
     phone_number_id: uuid.UUID | None = None
     scheduled_at: datetime | None = None
+    template_variables: dict | None = None
 
 
 class AddRecipientsBody(BaseModel):
@@ -76,6 +78,7 @@ def _campaign_to_dict(c: Campaign) -> dict:
         "failed_count": c.failed_count,
         "estimated_cost": float(c.estimated_cost) if c.estimated_cost else None,
         "actual_cost": float(c.actual_cost) if c.actual_cost else None,
+        "template_variables": c.template_variables or {},
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
     }
@@ -161,6 +164,7 @@ async def create_campaign(body: CampaignCreate, current_user: OrgAdmin, db: DbDe
         status=CampaignStatus.draft,
         scheduled_at=body.scheduled_at,
         created_by=current_user.id,
+        template_variables=body.template_variables or {},
     )
     db.add(campaign)
     await db.commit()
@@ -188,6 +192,8 @@ async def update_campaign(campaign_id: uuid.UUID, body: CampaignUpdate, current_
         c.phone_number_id = body.phone_number_id  # type: ignore[assignment]
     if body.scheduled_at is not None:
         c.scheduled_at = body.scheduled_at  # type: ignore[assignment]
+    if body.template_variables is not None:
+        c.template_variables = body.template_variables  # type: ignore[assignment]
 
     await db.commit()
     await db.refresh(c)

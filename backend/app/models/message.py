@@ -91,7 +91,7 @@ class Message(Base):
         UUID(as_uuid=True), ForeignKey("message_templates.id"), nullable=True
     )
     campaign_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("campaigns.id", use_alter=True, name="fk_messages_campaign_id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("campaigns.id", use_alter=True, name="fk_messages_campaign_id", ondelete="SET NULL"), nullable=True
     )
     cost_credits: Mapped[float | None] = mapped_column(nullable=True)
 

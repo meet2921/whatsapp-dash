@@ -648,20 +648,139 @@ export default function TemplatesPage() {
       {/* View existing template detail modal */}
       {viewTpl && (
         <div style={s.overlay}>
-          <div style={{ background:"#fff", borderRadius:16, padding:"28px 32px", width:"100%", maxWidth:540, maxHeight:"90vh", overflowY:"auto" }}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
-              <h2 style={{ margin:0, fontSize:18, fontWeight:700, color:"#111827" }}>{viewTpl.name}</h2>
-              <button onClick={()=>setViewTpl(null)} style={{ background:"none", border:"none", fontSize:20, cursor:"pointer", color:"#6b7280" }}>✕</button>
+          <div style={{ background:"#fff", borderRadius:16, width:"100%", maxWidth:780, maxHeight:"92vh", overflowY:"auto", display:"flex", flexDirection:"column" }}>
+            {/* Header */}
+            <div style={{ padding:"20px 28px", borderBottom:"1px solid #e5e7eb", display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexShrink:0 }}>
+              <div>
+                <h2 style={{ margin:0, fontSize:18, fontWeight:700, color:"#111827" }}>{viewTpl.name}</h2>
+                <div style={{ display:"flex", gap:6, marginTop:6, flexWrap:"wrap" }}>
+                  <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, background:"#dbeafe", color:"#1d4ed8" }}>{viewTpl.category}</span>
+                  <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, background:"#f3f4f6", color:"#374151" }}>{viewTpl.language}</span>
+                  <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, ...(statusColor[viewTpl.status]?{background:statusColor[viewTpl.status][0],color:statusColor[viewTpl.status][1]}:{background:"#f3f4f6",color:"#6b7280"}) }}>{viewTpl.status}</span>
+                </div>
+              </div>
+              <button onClick={()=>setViewTpl(null)} style={{ background:"none", border:"none", fontSize:22, cursor:"pointer", color:"#6b7280", lineHeight:1, flexShrink:0 }}>✕</button>
             </div>
-            <div style={{ display:"flex", gap:8, marginBottom:16, flexWrap:"wrap" }}>
-              <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, background:"#dbeafe", color:"#1d4ed8" }}>{viewTpl.category}</span>
-              <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, background:"#f3f4f6", color:"#374151" }}>{viewTpl.language}</span>
-              <span style={{ padding:"2px 8px", borderRadius:999, fontSize:11, fontWeight:600, ...(statusColor[viewTpl.status]?{background:statusColor[viewTpl.status][0],color:statusColor[viewTpl.status][1]}:{background:"#f3f4f6",color:"#6b7280"}) }}>{viewTpl.status}</span>
+
+            {/* Body: info + phone preview */}
+            <div style={{ display:"flex", flex:1, minHeight:0 }}>
+              {/* Left: metadata + component details */}
+              <div style={{ flex:1, padding:"24px 28px", overflowY:"auto", borderRight:"1px solid #e5e7eb" }}>
+                {viewTpl.rejection_reason && (
+                  <div style={{ padding:"10px 14px", background:"#fef2f2", border:"1px solid #fecaca", borderRadius:8, fontSize:13, color:"#991b1b", marginBottom:16, lineHeight:1.5 }}>
+                    <strong>Rejection reason:</strong> {viewTpl.rejection_reason}
+                  </div>
+                )}
+
+                {/* Component breakdown */}
+                {(viewTpl.components as Record<string, unknown>[]).map((comp, i) => {
+                  const ct = (comp.type as string).toUpperCase();
+                  const text = typeof comp.text === "string" ? comp.text : null;
+                  const buttons = comp.buttons as Array<Record<string, unknown>> | undefined;
+                  const format = comp.format as string | undefined;
+
+                  return (
+                    <div key={i} style={{ marginBottom:16 }}>
+                      <div style={{ fontSize:11, fontWeight:700, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:6 }}>
+                        {ct}{format && format !== "TEXT" ? ` · ${format}` : ""}
+                      </div>
+                      {text && (
+                        <div style={{ background:"#f9fafb", border:"1px solid #e5e7eb", borderRadius:8, padding:"10px 14px", fontSize:13, color:"#374151", lineHeight:1.7, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                          {text}
+                        </div>
+                      )}
+                      {ct === "BUTTONS" && buttons && (
+                        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                          {buttons.map((b, j) => (
+                            <div key={j} style={{ background:"#f0fdf4", border:"1px solid #bbf7d0", borderRadius:8, padding:"8px 14px", fontSize:13, color:"#15803d", display:"flex", alignItems:"center", gap:8 }}>
+                              <span style={{ fontSize:15 }}>
+                                {b.type === "URL" ? "🔗" : b.type === "PHONE_NUMBER" ? "📞" : "↩"}
+                              </span>
+                              <div>
+                                <div style={{ fontWeight:600 }}>{String(b.text ?? "")}</div>
+                                {b.url != null && <div style={{ fontSize:11, color:"#6b7280", marginTop:1 }}>{String(b.url)}</div>}
+                                {b.phone_number != null && <div style={{ fontSize:11, color:"#6b7280", marginTop:1 }}>{String(b.phone_number)}</div>}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {viewTpl.meta_template_id && (
+                  <div style={{ fontSize:12, color:"#9ca3af", marginTop:8, padding:"8px 12px", background:"#f9fafb", borderRadius:6 }}>
+                    Meta ID: <code style={{ fontFamily:"monospace" }}>{viewTpl.meta_template_id}</code>
+                  </div>
+                )}
+              </div>
+
+              {/* Right: WhatsApp phone frame preview */}
+              <div style={{ width:280, flexShrink:0, padding:"24px 20px", background:"#f9fafb", display:"flex", flexDirection:"column", alignItems:"center" }}>
+                <div style={{ fontSize:13, fontWeight:600, color:"#374151", marginBottom:14, alignSelf:"flex-start" }}>Preview</div>
+                <div style={{ width:240, background:"#fff", borderRadius:28, border:"7px solid #1f2937", overflow:"hidden", boxShadow:"0 16px 40px rgba(0,0,0,.15)" }}>
+                  {/* Status bar */}
+                  <div style={{ background:"#1f2937", padding:"7px 14px 4px", display:"flex", justifyContent:"space-between" }}>
+                    <span style={{ fontSize:10, color:"#fff", fontWeight:600 }}>9:41</span>
+                    <span style={{ fontSize:10, color:"#fff" }}>●●●●</span>
+                  </div>
+                  {/* Chat header bar */}
+                  <div style={{ background:"#075E54", padding:"8px 12px", display:"flex", alignItems:"center", gap:8 }}>
+                    <div style={{ width:28, height:28, borderRadius:"50%", background:"#25D366", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>💼</div>
+                    <div>
+                      <div style={{ fontSize:12, fontWeight:600, color:"#fff" }}>Business</div>
+                      <div style={{ fontSize:9, color:"rgba(255,255,255,0.7)" }}>online</div>
+                    </div>
+                  </div>
+                  {/* Chat body */}
+                  <div style={{ background:"#e5ddd5", padding:"10px 8px", minHeight:200 }}>
+                    {(() => {
+                      const comps = viewTpl.components as Record<string, unknown>[];
+                      const header = comps.find(c => (c.type as string).toUpperCase() === "HEADER");
+                      const body = comps.find(c => (c.type as string).toUpperCase() === "BODY");
+                      const footer = comps.find(c => (c.type as string).toUpperCase() === "FOOTER");
+                      const btnsComp = comps.find(c => (c.type as string).toUpperCase() === "BUTTONS");
+                      const buttons = btnsComp?.buttons as Array<Record<string, unknown>> | undefined;
+                      const headerText = typeof header?.text === "string" ? header.text : null;
+                      const bodyText = typeof body?.text === "string" ? body.text : null;
+                      const footerText = typeof footer?.text === "string" ? footer.text : null;
+
+                      return (
+                        <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                          <div style={{ background:"#fff", borderRadius: headerText ? "6px 6px 0 0" : "0 6px 6px 6px", padding:"8px 10px", fontSize:11, color:"#111827", lineHeight:1.5, boxShadow:"0 1px 2px rgba(0,0,0,.08)", position:"relative" }}>
+                            {!headerText && <div style={{ position:"absolute", top:0, left:-6, width:0, height:0, borderTop:"6px solid #fff", borderLeft:"6px solid transparent" }} />}
+                            {headerText && (
+                              <div style={{ fontWeight:700, marginBottom:4, fontSize:12 }}>{headerText}</div>
+                            )}
+                            {bodyText && (
+                              <div style={{ whiteSpace:"pre-wrap", wordBreak:"break-word" }}>{bodyText}</div>
+                            )}
+                            {!headerText && !bodyText && (
+                              <span style={{ color:"#9ca3af" }}>(empty)</span>
+                            )}
+                            <div style={{ float:"right", fontSize:9, color:"#9ca3af", marginLeft:6, marginTop:2 }}>✓✓</div>
+                          </div>
+                          {footerText && (
+                            <div style={{ background:"#fff", borderRadius:"0 0 6px 6px", padding:"5px 10px", fontSize:10, color:"#9ca3af", boxShadow:"0 1px 2px rgba(0,0,0,.08)" }}>
+                              {footerText}
+                            </div>
+                          )}
+                          {buttons?.map((b, i) => (
+                            <div key={i} style={{ background:"#fff", borderRadius:6, padding:"7px 10px", textAlign:"center", fontSize:11, color:"#25D366", fontWeight:600, boxShadow:"0 1px 2px rgba(0,0,0,.08)", marginTop:i===0?4:2 }}>
+                              {b.type === "URL" ? "🔗 " : b.type === "PHONE_NUMBER" ? "📞 " : "↩ "}{String(b.text ?? "")}
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+                <p style={{ fontSize:11, color:"#9ca3af", marginTop:10, textAlign:"center" }}>
+                  Variables shown as-is
+                </p>
+              </div>
             </div>
-            <pre style={{ background:"#f9fafb", padding:16, borderRadius:8, fontSize:12, overflowX:"auto", lineHeight:1.6, maxHeight:340 }}>
-              {JSON.stringify(viewTpl.components, null, 2)}
-            </pre>
-            {viewTpl.meta_template_id && <p style={{ fontSize:12, color:"#9ca3af", marginTop:8 }}>Meta ID: {viewTpl.meta_template_id}</p>}
           </div>
         </div>
       )}

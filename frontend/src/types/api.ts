@@ -211,6 +211,7 @@ export interface Campaign {
   failed_count: number;
   estimated_cost: number | null;
   actual_cost: number | null;
+  template_variables: Record<string, string>;
   created_at: string | null;
   updated_at: string | null;
 }

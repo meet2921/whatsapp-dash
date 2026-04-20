@@ -34,8 +34,17 @@ function extractText(content: Record<string, unknown>, templateList?: Template[]
   if (typeof content.template_name === "string") {
     const tpl = templateList?.find(t => t.name === content.template_name);
     if (tpl) {
-      const bodyComp = tpl.components.find((c: Record<string, unknown>) => c.type === "BODY") as Record<string, unknown> | undefined;
-      if (bodyComp && typeof bodyComp.text === "string") return bodyComp.text;
+      const bodyComp = tpl.components.find((c: Record<string, unknown>) => (c.type as string).toUpperCase() === "BODY") as Record<string, unknown> | undefined;
+      if (bodyComp && typeof bodyComp.text === "string") {
+        let text = bodyComp.text;
+        // Substitute stored component parameters into the template body text
+        const components = content.components as Array<{ type: string; parameters?: Array<{ type: string; text?: string }> }> | null;
+        const bodyParams = components?.find(c => c.type === "body")?.parameters ?? [];
+        if (bodyParams.length > 0) {
+          text = text.replace(/\{\{(\d+)\}\}/g, (_: string, n: string) => bodyParams[parseInt(n) - 1]?.text ?? `{{${n}}}`);
+        }
+        return text;
+      }
     }
     return `📄 ${String(content.template_name)}`;
   }
@@ -90,6 +99,8 @@ export default function ConversationsPage() {
   // Template modal
   const [showTplModal, setShowTplModal] = useState(false);
   const [tplForm, setTplForm] = useState({ phone_number_id: "", to: "", template_id: "", template_name: "", language_code: "" });
+  // Flat map: "HEADER-1" → value, "BODY-2" → value, etc.
+  const [tplVars, setTplVars] = useState<Record<string, string>>({});
   const [sendingTpl, setSendingTpl] = useState(false);
 
 
@@ -311,16 +322,78 @@ export default function ConversationsPage() {
     }
   }
 
+  // ── Template variable helpers ──────────────────────────────────────────────
+
+  function getCompVarNums(comp: Record<string, unknown>): number[] {
+    const text = typeof comp.text === "string" ? comp.text : "";
+    const nums = [...new Set((text.match(/\{\{(\d+)\}\}/g) ?? []).map(m => parseInt(m.slice(2, -2))))];
+    return nums.sort((a, b) => a - b);
+  }
+
+  function getTplExamples(tpl: Template): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const rawComp of tpl.components as Record<string, unknown>[]) {
+      const ct = (rawComp.type as string).toUpperCase();
+      const example = rawComp.example as Record<string, unknown> | undefined;
+      const nums = getCompVarNums(rawComp);
+      if (ct === "HEADER") {
+        const vals = example?.header_text as string[] | undefined;
+        nums.forEach((n, i) => { out[`HEADER-${n}`] = vals?.[i] ?? ""; });
+      }
+      if (ct === "BODY") {
+        const vals = (example?.body_text as string[][] | undefined)?.[0];
+        nums.forEach((n, i) => { out[`BODY-${n}`] = vals?.[i] ?? ""; });
+      }
+    }
+    return out;
+  }
+
+  function buildTplComponents(tpl: Template, vars: Record<string, string>): unknown[] | undefined {
+    const comps: unknown[] = [];
+    for (const ct of ["HEADER", "BODY"]) {
+      const comp = (tpl.components as Record<string, unknown>[]).find(c => (c.type as string).toUpperCase() === ct);
+      if (!comp) continue;
+      const nums = getCompVarNums(comp);
+      if (nums.length === 0) continue;
+      comps.push({
+        type: ct.toLowerCase(),
+        parameters: nums.map(n => ({ type: "text", text: vars[`${ct}-${n}`] ?? "" })),
+      });
+    }
+    return comps.length > 0 ? comps : undefined;
+  }
+
+  function renderTplPreview(tpl: Template, vars: Record<string, string>): { header?: string; body?: string; buttons?: string[] } {
+    const out: { header?: string; body?: string; buttons?: string[] } = {};
+    for (const rawComp of tpl.components as Record<string, unknown>[]) {
+      const ct = (rawComp.type as string).toUpperCase();
+      const text = typeof rawComp.text === "string" ? rawComp.text : "";
+      const resolved = text.replace(/\{\{(\d+)\}\}/g, (_: string, n: string) => {
+        const val = vars[`${ct}-${n}`];
+        return val ? val : `{{${n}}}`;
+      });
+      if (ct === "HEADER") out.header = resolved;
+      if (ct === "BODY") out.body = resolved;
+      if (ct === "BUTTONS") {
+        const btns = rawComp.buttons as Array<Record<string, unknown>> | undefined;
+        out.buttons = btns?.map(b => String(b.text ?? "")) ?? [];
+      }
+    }
+    return out;
+  }
+
   async function handleSendTemplate(e: { preventDefault(): void }) {
     e.preventDefault(); setSendingTpl(true); setError(null);
+    const tpl = templateList.find(x => x.id === tplForm.template_id);
     try {
       await messagesApi.sendTemplate({
         phone_number_id: tplForm.phone_number_id,
         to: tplForm.to,
         template_name: tplForm.template_name,
         language_code: tplForm.language_code,
+        components: tpl ? buildTplComponents(tpl, tplVars) : undefined,
       });
-      notify("Template sent!"); setShowTplModal(false);
+      notify("Template sent!"); setShowTplModal(false); setTplVars({});
       load();
     } catch (err) { setError(err instanceof Error ? err.message : "Failed"); }
     finally { setSendingTpl(false); }
@@ -581,49 +654,129 @@ export default function ConversationsPage() {
               Only <strong>APPROVED</strong> templates can be sent. Required to start or re-open a conversation.
             </p>
             {error && <div style={s.errorInline}>{error}</div>}
-            <form onSubmit={handleSendTemplate} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <FormField label="Phone Number (sender)">
-                <select
-                  value={tplForm.phone_number_id}
-                  onChange={e => setTplForm(f => ({ ...f, phone_number_id: e.target.value }))}
-                  required style={s.input}
+
+            {/* Two-column layout: form left, preview right */}
+            <div style={{ display: "flex", gap: 20, alignItems: "flex-start" }}>
+
+              {/* Left: form */}
+              <form onSubmit={handleSendTemplate} style={{ flex: 1, display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+                <FormField label="Phone Number (sender)">
+                  <select
+                    value={tplForm.phone_number_id}
+                    onChange={e => setTplForm(f => ({ ...f, phone_number_id: e.target.value }))}
+                    required style={s.input}
+                  >
+                    <option value="">Select phone number…</option>
+                    {phoneList.filter(p => p.is_active).map(p => (
+                      <option key={p.id} value={p.id}>{p.display_number ?? p.phone_number_id}</option>
+                    ))}
+                  </select>
+                </FormField>
+                <FormField label="Recipient (E.164 format, e.g. +919876543210)">
+                  <input
+                    value={tplForm.to}
+                    onChange={e => setTplForm(f => ({ ...f, to: e.target.value }))}
+                    placeholder="+919876543210" required style={s.input}
+                  />
+                </FormField>
+                <FormField label="Template">
+                  <select
+                    value={tplForm.template_id}
+                    onChange={e => {
+                      const t = templateList.find(x => x.id === e.target.value);
+                      setTplForm(f => ({ ...f, template_id: e.target.value, template_name: t?.name ?? "", language_code: t?.language ?? "en" }));
+                      setTplVars(t ? getTplExamples(t) : {});
+                    }}
+                    required style={s.input}
+                  >
+                    <option value="">Select template…</option>
+                    {templateList.filter(t => t.status === "APPROVED").map(t => (
+                      <option key={t.id} value={t.id}>{t.name} ({t.language})</option>
+                    ))}
+                  </select>
+                </FormField>
+
+                {/* Variable input fields — sorted numerically per component */}
+                {tplForm.template_id && (() => {
+                  const tpl = templateList.find(x => x.id === tplForm.template_id);
+                  if (!tpl) return null;
+                  const fields: React.ReactNode[] = [];
+                  for (const ct of ["HEADER", "BODY"]) {
+                    const comp = (tpl.components as Record<string, unknown>[]).find(c => (c.type as string).toUpperCase() === ct);
+                    if (!comp) continue;
+                    const nums = getCompVarNums(comp);
+                    nums.forEach(n => {
+                      const key = `${ct}-${n}`;
+                      fields.push(
+                        <FormField key={key} label={`${ct === "HEADER" ? "Header" : "Body"} — {{${n}}}`}>
+                          <input
+                            value={tplVars[key] ?? ""}
+                            onChange={e => setTplVars(prev => ({ ...prev, [key]: e.target.value }))}
+                            placeholder={getTplExamples(tpl)[key] || `value for {{${n}}}`}
+                            required
+                            style={s.input}
+                          />
+                        </FormField>
+                      );
+                    });
+                  }
+                  return fields.length > 0 ? <>{fields}</> : null;
+                })()}
+
+                <button
+                  type="submit"
+                  disabled={sendingTpl}
+                  style={{ ...s.btnGreen, opacity: sendingTpl ? 0.6 : 1, padding: "10px", borderRadius: 8, border: "none", cursor: sendingTpl ? "not-allowed" : "pointer" }}
                 >
-                  <option value="">Select phone number…</option>
-                  {phoneList.filter(p => p.is_active).map(p => (
-                    <option key={p.id} value={p.id}>{p.display_number ?? p.phone_number_id}</option>
-                  ))}
-                </select>
-              </FormField>
-              <FormField label="Recipient (E.164 format, e.g. +919876543210)">
-                <input
-                  value={tplForm.to}
-                  onChange={e => setTplForm(f => ({ ...f, to: e.target.value }))}
-                  placeholder="+919876543210" required style={s.input}
-                />
-              </FormField>
-              <FormField label="Template">
-                <select
-                  value={tplForm.template_id}
-                  onChange={e => {
-                    const t = templateList.find(x => x.id === e.target.value);
-                    setTplForm(f => ({ ...f, template_id: e.target.value, template_name: t?.name ?? "", language_code: t?.language ?? "en" }));
-                  }}
-                  required style={s.input}
-                >
-                  <option value="">Select template…</option>
-                  {templateList.filter(t => t.status === "APPROVED").map(t => (
-                    <option key={t.id} value={t.id}>{t.name} ({t.language})</option>
-                  ))}
-                </select>
-              </FormField>
-              <button
-                type="submit"
-                disabled={sendingTpl}
-                style={{ ...s.btnGreen, opacity: sendingTpl ? 0.6 : 1, padding: "10px", borderRadius: 8, border: "none", cursor: sendingTpl ? "not-allowed" : "pointer" }}
-              >
-                {sendingTpl ? "Sending…" : "Send Template"}
-              </button>
-            </form>
+                  {sendingTpl ? "Sending…" : "Send Template"}
+                </button>
+              </form>
+
+              {/* Right: live preview */}
+              {tplForm.template_id && (() => {
+                const tpl = templateList.find(x => x.id === tplForm.template_id);
+                if (!tpl) return null;
+                const preview = renderTplPreview(tpl, tplVars);
+                return (
+                  <div style={{ width: 240, flexShrink: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#8696a0", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Preview</div>
+                    <div style={{ background: "#0b141a", borderRadius: 10, padding: 10, border: "1px solid #2a3942" }}>
+                      {/* WhatsApp bubble */}
+                      <div style={{ background: "#005c4b", borderRadius: "8px 0 8px 8px", padding: "8px 10px", maxWidth: "100%", wordBreak: "break-word" }}>
+                        {preview.header && (
+                          <div style={{ fontWeight: 700, fontSize: 13, color: "#e9edef", marginBottom: 4 }}>
+                            {preview.header}
+                          </div>
+                        )}
+                        {preview.body && (
+                          <div style={{ fontSize: 13, color: "#e9edef", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+                            {preview.body}
+                          </div>
+                        )}
+                      </div>
+                      {/* Buttons */}
+                      {preview.buttons && preview.buttons.length > 0 && (
+                        <div style={{ marginTop: 4 }}>
+                          {preview.buttons.map((btn, i) => (
+                            <div key={i} style={{
+                              background: "#1f2c33", borderRadius: 8, padding: "8px 10px",
+                              fontSize: 13, color: "#00a884", textAlign: "center", marginTop: 4,
+                              fontWeight: 600, border: "1px solid #2a3942",
+                            }}>
+                              {btn}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#8696a0", marginTop: 6, textAlign: "center" }}>
+                      Text in brackets are unfilled variables
+                    </div>
+                  </div>
+                );
+              })()}
+
+            </div>
           </div>
         </div>
       )}
@@ -853,7 +1006,7 @@ const s: Record<string, React.CSSProperties> = {
 
   // Modal
   modalOverlay:  { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 16 },
-  modalBox:      { background: "#1f2c33", borderRadius: 12, padding: "24px 28px", width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto" },
+  modalBox:      { background: "#1f2c33", borderRadius: 12, padding: "24px 28px", width: "100%", maxWidth: 780, maxHeight: "90vh", overflowY: "auto" },
   modalHeader:   { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 },
   modalTitle:    { margin: 0, fontSize: 17, fontWeight: 700, color: "#e9edef" },
   modalClose:    { background: "none", border: "none", color: "#8696a0", fontSize: 20, cursor: "pointer" },

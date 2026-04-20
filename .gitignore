@@ -12,7 +12,7 @@ venv/
 .venv/
 env/
 .env.local
-requirements.txt.bak
+requirements.txt
 
 # Large Next.js/SWC binaries (The specific cause of your error)
 *.node

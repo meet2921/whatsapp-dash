@@ -233,9 +233,9 @@ export const campaigns = {
     return get<import("@/types/api").CampaignsPage>(`/campaigns${q.toString() ? "?" + q : ""}`);
   },
   get: (id: string) => get<import("@/types/api").Campaign>(`/campaigns/${id}`),
-  create: (body: { name: string; template_id: string; phone_number_id: string; scheduled_at?: string }) =>
+  create: (body: { name: string; template_id: string; phone_number_id: string; scheduled_at?: string; template_variables?: Record<string, string> }) =>
     post<import("@/types/api").Campaign>("/campaigns", body),
-  update: (id: string, body: Partial<{ name: string; template_id: string; phone_number_id: string; scheduled_at: string }>) =>
+  update: (id: string, body: Partial<{ name: string; template_id: string; phone_number_id: string; scheduled_at: string; template_variables: Record<string, string> }>) =>
     patch<import("@/types/api").Campaign>(`/campaigns/${id}`, body),
   delete: (id: string) => del<void>(`/campaigns/${id}`),
   addRecipients: (id: string, body: { phones?: string[]; tag_id?: string; all_opted_in?: boolean }) =>

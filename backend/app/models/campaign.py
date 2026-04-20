@@ -56,6 +56,7 @@ class Campaign(Base, TimestampMixin):
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     estimated_cost: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     actual_cost: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
+    template_variables: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )

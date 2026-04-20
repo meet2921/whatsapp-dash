@@ -38,24 +38,81 @@ export default function CampaignsPage() {
   const [phones, setPhones] = useState<PhoneNumber[]>([]);
   const [tags, setTags] = useState<ContactTag[]>([]);
   const [form, setForm] = useState({ name: "", template_id: "", phone_number_id: "" });
+  const [tplVars, setTplVars] = useState<Record<string, string>>({});
+  const [selectedTpl, setSelectedTpl] = useState<Template | null>(null);
   const [addMode, setAddMode] = useState<"all_opted_in" | "tag" | "phones">("all_opted_in");
   const [addTag, setAddTag] = useState("");
   const [addPhones, setAddPhones] = useState("");
 
   const notify = (msg: string) => { setSuccess(msg); setTimeout(() => setSuccess(null), 3000); };
 
-  const load = async () => {
-    setLoading(true);
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [p, t] = await Promise.all([campaignsApi.list({ limit: 50 }), phonesApi.list()]);
       setList(p.items);
       setTotal(p.total);
       setPhones(t);
-    } catch (e) { setError(e instanceof Error ? e.message : "Failed"); }
-    finally { setLoading(false); }
+    } catch (e) { if (!silent) setError(e instanceof Error ? e.message : "Failed"); }
+    finally { if (!silent) setLoading(false); }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    const interval = setInterval(() => load(true), 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  function getCompVarNums(comp: Record<string, unknown>): number[] {
+    const text = typeof comp.text === "string" ? comp.text : "";
+    const nums = [...new Set((text.match(/\{\{(\d+)\}\}/g) ?? []).map(m => parseInt(m.slice(2, -2))))];
+    return nums.sort((a, b) => a - b);
+  }
+
+  function getTplVarFields(tpl: Template): Array<{ key: string; label: string }> {
+    const comps = (tpl.components ?? []) as Array<Record<string, unknown>>;
+    const fields: Array<{ key: string; label: string }> = [];
+    for (const comp of comps) {
+      const ct = (typeof comp.type === "string" ? comp.type : "").toUpperCase();
+      if (ct !== "HEADER" && ct !== "BODY") continue;
+      const nums = getCompVarNums(comp);
+      for (const n of nums) {
+        fields.push({ key: `${ct}-${n}`, label: `${ct} {{${n}}}` });
+      }
+    }
+    return fields;
+  }
+
+  function resolvePreviewVar(key: string, vars: Record<string, string>): string {
+    const val = vars[key] ?? "";
+    if (val === "@contact.name") return "John Doe";
+    if (val === "@contact.phone") return "+91 98765 43210";
+    return val || `{{${key}}}`;
+  }
+
+  function buildPreview(tpl: Template | null, vars: Record<string, string>) {
+    if (!tpl) return { header: null, body: null, footer: null, buttons: [] as string[] };
+    const comps = (tpl.components ?? []) as Array<Record<string, unknown>>;
+    let header: string | null = null;
+    let body: string | null = null;
+    let footer: string | null = null;
+    const buttons: string[] = [];
+    for (const comp of comps) {
+      const ct = (typeof comp.type === "string" ? comp.type : "").toUpperCase();
+      const text = typeof comp.text === "string" ? comp.text : "";
+      if (ct === "HEADER") {
+        header = text.replace(/\{\{(\d+)\}\}/g, (_: string, n: string) => resolvePreviewVar(`HEADER-${n}`, vars));
+      } else if (ct === "BODY") {
+        body = text.replace(/\{\{(\d+)\}\}/g, (_: string, n: string) => resolvePreviewVar(`BODY-${n}`, vars));
+      } else if (ct === "FOOTER") {
+        footer = text;
+      } else if (ct === "BUTTONS") {
+        const btns = comp.buttons as Array<Record<string, unknown>> ?? [];
+        btns.forEach(b => { if (typeof b.text === "string") buttons.push(b.text); });
+      }
+    }
+    return { header, body, footer, buttons };
+  }
 
   async function openCreate() {
     try {
@@ -64,14 +121,23 @@ export default function CampaignsPage() {
       setTags(tg);
     } catch { /* ignore */ }
     setForm({ name: "", template_id: "", phone_number_id: "" });
+    setTplVars({});
+    setSelectedTpl(null);
     setModal("create");
     setError(null);
+  }
+
+  function handleTplSelect(tplId: string) {
+    setForm(f => ({ ...f, template_id: tplId }));
+    const tpl = templates.find(t => t.id === tplId) ?? null;
+    setSelectedTpl(tpl);
+    setTplVars({});
   }
 
   async function handleCreate(e: React.SyntheticEvent) {
     e.preventDefault(); setBusy(true); setError(null);
     try {
-      const c = await campaignsApi.create(form);
+      const c = await campaignsApi.create({ ...form, template_variables: tplVars });
       notify("Campaign created!"); setModal(null);
       // Auto-open recipient add
       setSelected(c); setModal("recipients");
@@ -241,31 +307,147 @@ export default function CampaignsPage() {
         )}
       </div>
 
-      {/* Create campaign modal */}
-      {modal === "create" && (
-        <ModalWrap title="New Campaign" onClose={() => setModal(null)}>
-          {error && <div style={{ ...s.error, marginBottom: 12 }}>{error}</div>}
-          <form onSubmit={handleCreate} style={s.form}>
-            <Field label="Campaign Name">
-              <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="April Promo Blast" required style={s.input} />
-            </Field>
-            <Field label="Template (must be APPROVED)">
-              <select value={form.template_id} onChange={e => setForm(f => ({ ...f, template_id: e.target.value }))} required style={s.input}>
-                <option value="">Select template…</option>
-                {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.language})</option>)}
-              </select>
-              {templates.length === 0 && <span style={{ fontSize: 11, color: "#9ca3af" }}>No approved templates found. Sync templates first.</span>}
-            </Field>
-            <Field label="Sender Phone Number">
-              <select value={form.phone_number_id} onChange={e => setForm(f => ({ ...f, phone_number_id: e.target.value }))} required style={s.input}>
-                <option value="">Select phone…</option>
-                {phones.map(p => <option key={p.id} value={p.id}>{p.display_name ?? p.display_number ?? p.phone_number_id}</option>)}
-              </select>
-            </Field>
-            <button type="submit" disabled={busy} style={busy ? { ...s.btnGreen, opacity: 0.6 } : s.btnGreen}>{busy ? "Creating…" : "Create & Add Recipients →"}</button>
-          </form>
-        </ModalWrap>
-      )}
+      {/* Create campaign modal — two-column with live preview */}
+      {modal === "create" && (() => {
+        const preview = buildPreview(selectedTpl, tplVars);
+        return (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 16 }}>
+            <div style={{ background: "#fff", borderRadius: 16, width: "100%", maxWidth: 860, maxHeight: "92vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              {/* Header */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 28px 16px", borderBottom: "1px solid #f3f4f6" }}>
+                <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#111827" }}>New Campaign</h2>
+                <button onClick={() => setModal(null)} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#6b7280" }}>✕</button>
+              </div>
+
+              {/* Body: form + preview */}
+              <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+                {/* Left: form */}
+                <div style={{ flex: 1, overflowY: "auto", padding: "20px 28px" }}>
+                  {error && <div style={{ ...s.error, marginBottom: 12 }}>{error}</div>}
+                  <form onSubmit={handleCreate} style={s.form}>
+                    <Field label="Campaign Name">
+                      <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="April Promo Blast" required style={s.input} />
+                    </Field>
+                    <Field label="Template (must be APPROVED)">
+                      <select value={form.template_id} onChange={e => handleTplSelect(e.target.value)} required style={s.input}>
+                        <option value="">Select template…</option>
+                        {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.language})</option>)}
+                      </select>
+                      {templates.length === 0 && <span style={{ fontSize: 11, color: "#9ca3af" }}>No approved templates found.</span>}
+                    </Field>
+
+                    {selectedTpl && getTplVarFields(selectedTpl).length > 0 && (
+                      <div style={{ background: "#f9fafb", borderRadius: 8, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase" as const, letterSpacing: "0.05em" }}>Template Variables</div>
+                        <div style={{ fontSize: 12, color: "#9ca3af" }}>Choose "Contact Name" for personalised fields — auto-filled per recipient.</div>
+                        {getTplVarFields(selectedTpl).map(({ key, label }) => {
+                          const val = tplVars[key] ?? "";
+                          const isContactField = val === "@contact.name" || val === "@contact.phone";
+                          return (
+                            <div key={key} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              <label style={{ fontSize: 12, fontWeight: 500, color: "#374151" }}>{label}</label>
+                              <div style={{ display: "flex", gap: 6 }}>
+                                <select
+                                  value={isContactField ? val : "custom"}
+                                  onChange={e => {
+                                    const v = e.target.value;
+                                    if (v === "custom") setTplVars(prev => ({ ...prev, [key]: "" }));
+                                    else setTplVars(prev => ({ ...prev, [key]: v }));
+                                  }}
+                                  style={{ ...s.input, width: 150, flexShrink: 0, fontSize: 12 }}
+                                >
+                                  <option value="custom">Fixed value</option>
+                                  <option value="@contact.name">Contact Name</option>
+                                  <option value="@contact.phone">Contact Phone</option>
+                                </select>
+                                {!isContactField ? (
+                                  <input
+                                    value={val}
+                                    onChange={e => setTplVars(v => ({ ...v, [key]: e.target.value }))}
+                                    placeholder="Enter value…"
+                                    style={{ ...s.input, flex: 1, fontSize: 12 }}
+                                  />
+                                ) : (
+                                  <div style={{ flex: 1, padding: "9px 12px", background: "#e0f2fe", borderRadius: 8, fontSize: 12, color: "#0369a1", border: "1px solid #bae6fd" }}>
+                                    Auto-filled from contact
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <Field label="Sender Phone Number">
+                      <select value={form.phone_number_id} onChange={e => setForm(f => ({ ...f, phone_number_id: e.target.value }))} required style={s.input}>
+                        <option value="">Select phone…</option>
+                        {phones.map(p => <option key={p.id} value={p.id}>{p.display_name ?? p.display_number ?? p.phone_number_id}</option>)}
+                      </select>
+                    </Field>
+                    <button type="submit" disabled={busy} style={busy ? { ...s.btnGreen, opacity: 0.6 } : s.btnGreen}>{busy ? "Creating…" : "Create & Add Recipients →"}</button>
+                  </form>
+                </div>
+
+                {/* Right: WhatsApp preview */}
+                <div style={{ width: 260, background: "#f0f2f5", borderLeft: "1px solid #e5e7eb", display: "flex", flexDirection: "column", alignItems: "center", padding: "20px 16px", flexShrink: 0 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#9ca3af", textTransform: "uppercase" as const, letterSpacing: "0.05em", marginBottom: 16 }}>Message Preview</div>
+                  {/* Phone frame */}
+                  <div style={{ width: 220, background: "#111827", borderRadius: 32, padding: "10px 6px", boxShadow: "0 8px 32px rgba(0,0,0,0.18)" }}>
+                    {/* Status bar */}
+                    <div style={{ background: "#25D366", borderRadius: "24px 24px 0 0", padding: "6px 12px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 9, color: "#fff", fontWeight: 600 }}>9:41</span>
+                      <div style={{ width: 40, height: 6, background: "#111827", borderRadius: 99, margin: "0 auto" }} />
+                      <span style={{ fontSize: 9, color: "#fff" }}>●●●</span>
+                    </div>
+                    {/* Chat header */}
+                    <div style={{ background: "#075e54", padding: "6px 10px", display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#25D366", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#fff", fontWeight: 700, flexShrink: 0 }}>W</div>
+                      <div>
+                        <div style={{ fontSize: 10, fontWeight: 700, color: "#fff" }}>{phoneName(form.phone_number_id) || "Your Number"}</div>
+                        <div style={{ fontSize: 8, color: "#b2dfdb" }}>online</div>
+                      </div>
+                    </div>
+                    {/* Chat body */}
+                    <div style={{ background: "#e5ddd5", minHeight: 280, padding: "10px 6px", backgroundImage: "url(\"data:image/svg+xml,%3Csvg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='%23c5b9a9' fill-opacity='0.15'%3E%3Cpath d='M20 20h20v20H20zM0 0h20v20H0z'/%3E%3C/g%3E%3C/svg%3E\")" }}>
+                      {!selectedTpl ? (
+                        <div style={{ textAlign: "center", color: "#9ca3af", fontSize: 11, paddingTop: 40 }}>Select a template to preview</div>
+                      ) : (
+                        <div style={{ background: "#fff", borderRadius: "8px 8px 8px 0", padding: "8px 10px", maxWidth: "92%", boxShadow: "0 1px 2px rgba(0,0,0,0.1)", fontSize: 11, lineHeight: 1.5, color: "#111827" }}>
+                          {preview.header && (
+                            <div style={{ fontWeight: 700, marginBottom: 5, color: "#111827", fontSize: 11 }}>{preview.header}</div>
+                          )}
+                          {preview.body && (
+                            <div style={{ whiteSpace: "pre-wrap", color: "#374151" }}>{preview.body}</div>
+                          )}
+                          {preview.footer && (
+                            <div style={{ marginTop: 4, fontSize: 10, color: "#9ca3af" }}>{preview.footer}</div>
+                          )}
+                          <div style={{ textAlign: "right", fontSize: 9, color: "#9ca3af", marginTop: 4 }}>
+                            {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} ✓✓
+                          </div>
+                          {preview.buttons.length > 0 && (
+                            <div style={{ marginTop: 6, borderTop: "1px solid #f3f4f6", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                              {preview.buttons.map((btn, i) => (
+                                <div key={i} style={{ textAlign: "center", color: "#0099ff", fontSize: 11, fontWeight: 600 }}>{btn}</div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  {selectedTpl && (
+                    <div style={{ marginTop: 12, fontSize: 10, color: "#9ca3af", textAlign: "center" }}>
+                      Contact Name shown as "John Doe" for preview
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Add recipients modal */}
       {modal === "recipients" && selected && (

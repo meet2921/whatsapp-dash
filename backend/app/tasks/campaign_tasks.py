@@ -20,6 +20,55 @@ BATCH_SIZE = 50
 RATE_LIMIT_DELAY = 0.05  # 50ms between sends → ~20/s (well under Meta's 80/s limit)
 
 
+def _build_components(tpl_components: list, template_vars: dict) -> list:
+    """Build Meta API components list from resolved template_variables.
+
+    template_vars format: {"HEADER-1": "val", "BODY-1": "val", "BODY-2": "val", ...}
+    Values starting with '@contact.' must already be resolved before calling this.
+    Skips any component where a required variable has an empty value.
+    Returns [{"type": "header", "parameters": [...]}, {"type": "body", "parameters": [...]}]
+    """
+    import re
+    result = []
+    for comp in tpl_components:
+        ct = (comp.get("type") or "").upper()
+        if ct not in ("HEADER", "BODY"):
+            continue
+        text = comp.get("text") or ""
+        nums = sorted(set(int(m) for m in re.findall(r"\{\{(\d+)\}\}", text)))
+        if not nums:
+            continue
+        values = [template_vars.get(f"{ct}-{n}", "") for n in nums]
+        if any(v == "" for v in values):
+            continue  # skip component if any variable is missing — avoids Meta 131008
+        parameters = [{"type": "text", "text": v} for v in values]
+        result.append({"type": ct.lower(), "parameters": parameters})
+    return result
+
+
+async def _resolve_vars(template_vars: dict, phone: str, db) -> dict:
+    """Replace @contact.name / @contact.phone tokens with actual contact data."""
+    if not any(str(v).startswith("@contact.") for v in template_vars.values()):
+        return template_vars
+
+    from sqlalchemy import select
+    from app.models.contact import Contact
+
+    contact = None
+    result = await db.execute(select(Contact).where(Contact.phone == phone))
+    contact = result.scalar_one_or_none()
+
+    resolved = {}
+    for key, val in template_vars.items():
+        if val == "@contact.name":
+            resolved[key] = (contact.name or phone) if contact else phone
+        elif val == "@contact.phone":
+            resolved[key] = phone
+        else:
+            resolved[key] = val
+    return resolved
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -52,6 +101,54 @@ def run_campaign(self, campaign_id: str, org_id: str) -> dict:
     """Dispatch all QUEUED recipients for a campaign."""
     logger.info("campaign.task_started", campaign_id=campaign_id)
     return _run(_run_campaign_async(campaign_id, org_id))
+
+
+async def _get_or_create_conversation(db, org_id, contact_id, phone_number_id):
+    from datetime import timedelta
+    from app.models.message import Conversation, ConversationStatus
+    from sqlalchemy import select
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.org_id == org_id,
+            Conversation.contact_id == contact_id,
+            Conversation.phone_number_id == phone_number_id,
+            Conversation.status == ConversationStatus.open,
+        ).order_by(Conversation.last_message_at.desc()).limit(1)
+    )
+    conv = result.scalar_one_or_none()
+    if not conv:
+        conv = Conversation(
+            org_id=org_id,
+            contact_id=contact_id,
+            phone_number_id=phone_number_id,
+            status=ConversationStatus.open,
+            session_expires_at=now + timedelta(hours=24),
+            last_message_at=now,
+        )
+        db.add(conv)
+        await db.flush()
+    return conv
+
+
+async def _save_campaign_message(db, org_id, conv_id, wa_message_id, campaign_id, template_id):
+    from app.models.message import Message, MessageDirection, MessageStatus
+    msg = Message(
+        org_id=org_id,
+        conversation_id=conv_id,
+        wa_message_id=wa_message_id,
+        direction=MessageDirection.outbound,
+        status=MessageStatus.sent,
+        message_type="template",
+        content={},
+        campaign_id=campaign_id,
+        template_id=template_id,
+        idempotency_key=f"campaign-{campaign_id}-{wa_message_id}",
+        sent_at=datetime.now(timezone.utc),
+    )
+    db.add(msg)
+    await db.flush()
+    return msg
 
 
 async def _run_campaign_async(campaign_id_str: str, org_id_str: str) -> dict:
@@ -113,6 +210,13 @@ async def _run_campaign_async(campaign_id_str: str, org_id_str: str) -> dict:
 
             client = MetaClient(waba.access_token)
 
+            template_vars: dict = campaign.template_variables or {}
+            tpl_components = template.components or []
+            # Determine if any variable needs per-recipient resolution
+            needs_per_recipient = any(str(v).startswith("@contact.") for v in template_vars.values())
+            # Pre-build static components once if no per-recipient vars
+            static_components = None if needs_per_recipient else _build_components(tpl_components, template_vars)
+
             # Process in batches
             while True:
                 # Re-check campaign status (may have been paused)
@@ -148,17 +252,31 @@ async def _run_campaign_async(campaign_id_str: str, org_id_str: str) -> dict:
                     try:
                         # Meta API expects E.164 without '+'
                         to_number = recipient.phone.lstrip("+")
-                        result = await client.send_template(
+                        if needs_per_recipient:
+                            resolved = await _resolve_vars(template_vars, recipient.phone, db)
+                            components = _build_components(tpl_components, resolved)
+                        else:
+                            components = static_components
+                        send_result = await client.send_template(
                             phone_number_id=phone.phone_number_id,
                             to=to_number,
                             template_name=template.name,
                             language_code=template.language,
-                            components=[],
+                            components=components,
                         )
                         recipient.status = RecipientStatus.sent  # type: ignore[assignment]
                         campaign.sent_count = campaign.sent_count + 1  # type: ignore[assignment]
                         sent += 1
-                        logger.debug("campaign.sent", campaign_id=campaign_id_str, to=to_number, wa_id=result.wa_message_id)
+
+                        # Save Message record so webhook status updates (delivered/read) can be tracked
+                        from app.models.contact import Contact
+                        from sqlalchemy import select as _sel
+                        contact_row = (await db.execute(_sel(Contact).where(Contact.phone == recipient.phone, Contact.org_id == org_id))).scalar_one_or_none()
+                        if contact_row:
+                            conv = await _get_or_create_conversation(db, org_id, contact_row.id, phone.id)
+                            await _save_campaign_message(db, org_id, conv.id, send_result.wa_message_id, campaign_id, campaign.template_id)
+
+                        logger.debug("campaign.sent", campaign_id=campaign_id_str, to=to_number, wa_id=send_result.wa_message_id)
                     except Exception as exc:
                         recipient.status = RecipientStatus.failed  # type: ignore[assignment]
                         recipient.error_message = str(exc)[:500]  # type: ignore[assignment]
