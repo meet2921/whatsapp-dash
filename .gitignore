@@ -11,6 +11,7 @@ __pycache__/
 venv/
 .venv/
 env/
+.env.local
 requirements.txt.bak
 
 # Large Next.js/SWC binaries (The specific cause of your error)
