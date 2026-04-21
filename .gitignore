@@ -16,4 +16,4 @@ requirements.txt
 
 # Large Next.js/SWC binaries (The specific cause of your error)
 *.node
-.next/
+*.next
